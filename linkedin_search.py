@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import urllib.parse
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
@@ -59,6 +60,16 @@ JOB_TITLE_SELECTORS = [
 JOB_COMPANY_SELECTORS = [
     ".job-details-jobs-unified-top-card__company-name",
     ".jobs-unified-top-card__company-name",
+]
+
+JOB_LOCATION_SELECTORS = [
+    ".job-details-jobs-unified-top-card__primary-description-container",
+    ".jobs-unified-top-card__tertiary-description-container",
+]
+
+JOB_DESCRIPTION_SELECTORS = [
+    ".jobs-description__content",
+    ".jobs-box__html-content",
 ]
 
 
@@ -226,8 +237,38 @@ def job_context(page):
     return {
         "title": text_of(page, JOB_TITLE_SELECTORS),
         "company": text_of(page, JOB_COMPANY_SELECTORS),
+        "location": text_of(page, JOB_LOCATION_SELECTORS),
+        "description": text_of(page, JOB_DESCRIPTION_SELECTORS),
         "url": page.url,
     }
+
+
+def choose_resume_path(ctx, config):
+    root = Path(__file__).resolve().parent / "resumes"
+    resumes = list(root.glob("*.pdf")) + list(root.glob("*.docx")) + list(root.glob("*.doc"))
+    text = " ".join((ctx.get(k) or "") for k in ("title", "description")).lower()
+    groups = {
+        "backend": ("backend", "python", "django", "fastapi", "api"),
+        "frontend": ("frontend", "front-end", "react", "vue", "javascript", "ui"),
+        "fullstack": ("fullstack", "full-stack", "mern", "full stack", "node"),
+        "dataanalyst": ("data", "analyst", "sql", "python", "analytics"),
+        "softwareengineer": ("software", "engineer", "developer", "coding"),
+        "fde": ("founding", "full-stack", "backend", "frontend", "engineer"),
+    }
+    def score(path):
+        stem = path.stem.lower()
+        group = next((g for g in groups if g in stem), "")
+        return sum(keyword in text for keyword in groups.get(group, ()))
+    best = max(resumes, key=score, default=None)
+    return str(best) if best and score(best) else config.get("default_resume_path") or config.get("resume_path")
+
+
+def allowed_location(ctx):
+    location = (ctx.get("location") or "").lower()
+    remote = "remote" in location or "work from home" in location
+    karachi = "karachi" in location
+    onsite = any(word in location for word in ("on-site", "onsite", "office"))
+    return remote or (karachi and onsite)
 
 
 def already_applied(page):
@@ -265,7 +306,6 @@ def run(config):
         sys.exit(1)
 
     gemini = Gemini(config)
-    profile = get_or_build_profile(resume_path, gemini=gemini)
     store = QAStore()
     print(f"Loaded {len(store)} cached question/answer pair(s).")
 
@@ -331,6 +371,18 @@ def run(config):
             label = f"{count} applicants" if count is not None else "applicant count unknown"
             print(f"\n[{i + 1}/{total}] {ctx['title']} @ {ctx['company']} ({label})")
 
+            if not allowed_location(ctx):
+                print(f"  Location not eligible: {ctx['location'] or 'unknown'}; skipping.")
+                skipped += 1
+                continue
+
+            resume_path = choose_resume_path(ctx, config)
+            if not resume_path or not os.path.exists(resume_path):
+                print("  No matching resume found; skipping.")
+                skipped += 1
+                continue
+            profile = get_or_build_profile(resume_path, gemini=gemini)
+
             if max_applicants and count is not None and count > max_applicants:
                 print(f"  Over the {max_applicants}-applicant cap; skipping.")
                 skipped += 1
@@ -347,7 +399,7 @@ def run(config):
                 continue
 
             try:
-                sent = apply_to_current_job(page, gemini, profile, ctx, store=store)
+                sent = apply_to_current_job(page, gemini, profile, ctx, resume_path=resume_path, store=store)
             except GeminiError:
                 raise
             except Exception as e:

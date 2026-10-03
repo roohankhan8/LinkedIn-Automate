@@ -1,6 +1,7 @@
 """Drive the LinkedIn Easy Apply modal: read every field, answer it with Gemini, submit."""
 
 import json
+import os
 import re
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -488,7 +489,7 @@ def step_signature(modal, fields):
     return progress + "|" + "|".join(sorted(f["label"] for f in fields))
 
 
-def apply_to_current_job(page, gemini, profile, job_context, max_steps=15, store=None):
+def apply_to_current_job(page, gemini, profile, job_context, resume_path=None, max_steps=15, store=None):
     """Run the whole Easy Apply wizard. Returns True if the application was sent."""
     store = store or QAStore()
     modal = wait_for_modal(page)
@@ -507,6 +508,11 @@ def apply_to_current_job(page, gemini, profile, job_context, max_steps=15, store
             return True
 
         fields = collect_fields(modal)
+        if resume_path and os.path.exists(resume_path):
+            upload = modal.locator('input[type="file"]').first
+            if upload.count():
+                upload.set_input_files(resume_path)
+                print(f"  Selected resume: {os.path.basename(resume_path)}")
         signature = step_signature(modal, fields)
         print(f"Step {step}: {len(fields)} field(s) detected.")
 

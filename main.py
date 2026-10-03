@@ -5,11 +5,11 @@ import threading
 import webview
 from app import app
 
-PORT = 5000
+PORT = 5050
 
 
 def run_flask():
-    app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
+    app.run(host="127.0.0.1", port=PORT, debug=True, use_reloader=False)
 
 
 def main():
