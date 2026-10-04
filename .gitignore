@@ -12,3 +12,6 @@ qa_cache.json
 dist*
 config.json
 error.log
+not_targeted_jobs.json
+not_targeted_jobs.txt
+applied_jobs.json

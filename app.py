@@ -39,22 +39,39 @@ class Runner:
             self._error = False
 
         def run():
-            with open(ERROR_LOG_PATH, "w", encoding="utf-8") as error_log:
+            info_log_path = BASE_DIR / "info.log"
+            with (
+                open(info_log_path, "w", encoding="utf-8") as info_log,
+                open(ERROR_LOG_PATH, "w", encoding="utf-8") as error_log,
+            ):
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.PIPE,
                     text=True,
                     cwd=str(BASE_DIR),
                 )
                 with self._lock:
                     self.process = process
-                for line in process.stdout:
-                    error_log.write(line)
-                    error_log.flush()
-                    with self._lock:
-                        self.logs.append(line.rstrip())
+
+                def collect(stream, output_file):
+                    for line in stream:
+                        output_file.write(line)
+                        output_file.flush()
+                        with self._lock:
+                            self.logs.append(line.rstrip())
+
+                stdout_thread = threading.Thread(
+                    target=collect, args=(process.stdout, info_log), daemon=True
+                )
+                stderr_thread = threading.Thread(
+                    target=collect, args=(process.stderr, error_log), daemon=True
+                )
+                stdout_thread.start()
+                stderr_thread.start()
                 process.wait()
+                stdout_thread.join()
+                stderr_thread.join()
                 with self._lock:
                     self.process = None
                     self._last_returncode = process.returncode

@@ -26,6 +26,10 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/128.0.0.0 Safari/537.36"
 )
+LINKS_PATH = Path(__file__).resolve().parent / "links.txt"
+NOT_TARGETED_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.txt"
+NOT_TARGETED_JSON_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.json"
+APPLIED_JOBS_PATH = Path(__file__).resolve().parent / "applied_jobs.json"
 
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -165,8 +169,8 @@ def search_url(keywords, config):
     return "https://www.linkedin.com/jobs/search/?" + urllib.parse.urlencode(params)
 
 
-def open_jobs_search(page, keywords, config):
-    url = search_url(keywords, config)
+def open_jobs_search(page, keywords, config, target_url=None):
+    url = target_url or search_url(keywords, config)
     print(f"Opening: {url}")
     try:
         # LinkedIn often keeps network requests open indefinitely. Waiting for
@@ -185,10 +189,11 @@ def open_jobs_search(page, keywords, config):
     page.wait_for_timeout(config.get("page_load_wait_ms", 3000))
 
     if "/jobs/search-results/" in page.url:
-        print("LinkedIn redirected to the SDUI results page; forcing the classic list.")
+        print("LinkedIn opened the SDUI results page; switching the same search to the classic list.")
+        classic_url = url.replace("/jobs/search-results/", "/jobs/search/")
         try:
             page.goto(
-                url,
+                classic_url,
                 wait_until="domcontentloaded",
                 timeout=int(config.get("navigation_timeout_ms", 60000)),
             )
@@ -267,29 +272,137 @@ def job_context(page):
 def choose_resume_path(ctx, config):
     root = Path(__file__).resolve().parent / "resumes"
     resumes = list(root.glob("*.pdf")) + list(root.glob("*.docx")) + list(root.glob("*.doc"))
-    text = " ".join((ctx.get(k) or "") for k in ("title", "description")).lower()
+    text = " ".join((ctx.get(k) or "") for k in ("title", "company", "description")).lower()
     groups = {
-        "backend": ("backend", "python", "django", "fastapi", "api"),
-        "frontend": ("frontend", "front-end", "react", "vue", "javascript", "ui"),
-        "fullstack": ("fullstack", "full-stack", "mern", "full stack", "node"),
-        "dataanalyst": ("data", "analyst", "sql", "python", "analytics"),
-        "softwareengineer": ("software", "engineer", "developer", "coding"),
-        "fde": ("founding", "full-stack", "backend", "frontend", "engineer"),
+        "backend": ("backend", "back-end", "django", "fastapi", "api", "server"),
+        "frontend": ("frontend", "front-end", "react", "vue", "javascript", "ui", "web"),
+        "fullstack": ("fullstack", "full-stack", "full stack", "mern", "node"),
+        "dataanalyst": ("data analyst", "data analysis", "sql", "analytics", "bi analyst"),
+        "softwareengineer": ("software engineer", "software developer", "engineering", "developer"),
+        "fde": ("founding", "founder", "early stage", "full-stack", "backend", "frontend"),
     }
+
     def score(path):
-        stem = path.stem.lower()
-        group = next((g for g in groups if g in stem), "")
-        return sum(keyword in text for keyword in groups.get(group, ()))
-    best = max(resumes, key=score, default=None)
-    return str(best) if best and score(best) else config.get("default_resume_path") or config.get("resume_path")
+        stem = re.sub(r"[^a-z0-9]+", " ", path.stem.lower())
+        matched_group = next((group for group in groups if group in stem), "")
+        keywords = groups.get(matched_group, ())
+        value = sum(3 for keyword in keywords if keyword in text)
+        value += sum(2 for keyword in keywords if keyword in stem)
+        if matched_group and matched_group in text:
+            value += 5
+        return value
+
+    ranked = sorted(resumes, key=lambda path: (-score(path), path.name.lower()))
+    if ranked and score(ranked[0]) > 0:
+        return str(ranked[0])
+
+    configured = config.get("default_resume_path") or config.get("resume_path")
+    if configured and os.path.exists(configured):
+        return configured
+    return None
+
+
+def job_id(ctx):
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(ctx.get("url", "")).query)
+    return (query.get("currentJobId") or [None])[0]
+
+
+def load_applied_ids():
+    if not APPLIED_JOBS_PATH.exists():
+        return set()
+    try:
+        data = json.loads(APPLIED_JOBS_PATH.read_text(encoding="utf-8"))
+        return set(str(value) for value in data if value)
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def save_applied_id(identifier):
+    applied = load_applied_ids()
+    applied.add(str(identifier))
+    APPLIED_JOBS_PATH.write_text(
+        json.dumps(sorted(applied), indent=2), encoding="utf-8"
+    )
+
+
+def not_targeted_key(ctx):
+    identifier = job_id(ctx)
+    if identifier:
+        return f"linkedin:{identifier}"
+    url = (ctx.get("url") or "").split("&", 1)[0]
+    if url:
+        return f"url:{url}"
+    parts = [re.sub(r"\s+", " ", (ctx.get(key) or "").strip().lower())
+             for key in ("title", "company", "location")]
+    return "details:" + "|".join(parts)
+
+
+def load_not_targeted():
+    if not NOT_TARGETED_JSON_PATH.exists():
+        return {}
+    try:
+        data = json.loads(NOT_TARGETED_JSON_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, list):
+        return {}
+    return {
+        item.get("key"): item
+        for item in data
+        if isinstance(item, dict) and item.get("key")
+    }
+
+
+def save_not_targeted(ctx, reason, role):
+    title = (ctx.get("title") or "Untitled job").replace("\n", " ").strip()
+    company = (ctx.get("company") or "Unknown company").replace("\n", " ").strip()
+    location = (ctx.get("location") or "Unknown location").replace("\n", " ").strip()
+    key = not_targeted_key(ctx)
+    records = load_not_targeted()
+    records[key] = {
+        "key": key,
+        "job_id": job_id(ctx),
+        "title": title,
+        "company": company,
+        "location": location,
+        "url": ctx.get("url") or "",
+        "reason": reason,
+        "target_role": role,
+    }
+    NOT_TARGETED_JSON_PATH.write_text(
+        json.dumps(sorted(records.values(), key=lambda item: item["key"]), indent=2),
+        encoding="utf-8",
+    )
+    
+    line = f"{title} | {company} | {location} | {reason} | target: {role}"
+    existing = (NOT_TARGETED_PATH.read_text(encoding="utf-8").splitlines()
+                if NOT_TARGETED_PATH.exists() else [])
+    lines = list(dict.fromkeys(existing + [line]))
+    NOT_TARGETED_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def allowed_location(ctx):
-    location = (ctx.get("location") or "").lower()
-    remote = "remote" in location or "work from home" in location
-    karachi = "karachi" in location
-    onsite = any(word in location for word in ("on-site", "onsite", "office"))
-    return remote or (karachi and onsite)
+    # Use the structured header fields only. Searching the full description
+    # would incorrectly classify jobs that merely mention remote work.
+    searchable = " ".join(
+        (ctx.get(key) or "") for key in ("title", "company", "location")
+    ).lower()
+    remote = "remote" in searchable or "work from home" in searchable
+    karachi = "karachi" in searchable
+    onsite_or_hybrid = any(
+        word in searchable for word in ("on-site", "onsite", "on site", "hybrid")
+    )
+    return remote or (karachi and onsite_or_hybrid)
+
+
+def load_links(path=LINKS_PATH):
+    if not path.exists():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
 
 
 def already_applied(page):
@@ -321,6 +434,7 @@ def run(config):
 
     max_applicants = int(config.get("applicants") or 0) or None
     max_applications = int(config.get("max_applications", 5))
+    applied_ids = load_applied_ids()
     resume_path = config.get("resume_path")
     if not resume_path:
         print("Set 'resume_path' in config.json to your resume PDF.")
@@ -358,7 +472,7 @@ def run(config):
         context.add_init_script(STEALTH_SCRIPT)
         page = context.new_page()
 
-        open_jobs_search(page, keywords, config)
+        open_jobs_search(page, keywords, config, target_url=config.get("target_url"))
 
         total = hydrate_cards(page)
         print(f"{total} job card(s) on this page.")
@@ -389,22 +503,37 @@ def run(config):
             page.wait_for_timeout(2500)
             ctx = job_context(page)
             count = applicant_count(page)
+            identifier = job_id(ctx)
             label = f"{count} applicants" if count is not None else "applicant count unknown"
             print(f"\n[{i + 1}/{total}] {ctx['title']} @ {ctx['company']} ({label})")
 
+            if identifier and identifier in applied_ids:
+                print(f"  Already applied; tracked currentJobId {identifier}; skipping.")
+                skipped += 1
+                continue
+
+            prior_skip = load_not_targeted().get(not_targeted_key(ctx))
+            if prior_skip:
+                print(f"  Previously skipped ({prior_skip['reason']}); skipping.")
+                skipped += 1
+                continue
+
             if not allowed_location(ctx):
+                save_not_targeted(ctx, "location not eligible", config["role"])
                 print(f"  Location not eligible: {ctx['location'] or 'unknown'}; skipping.")
                 skipped += 1
                 continue
 
             resume_path = choose_resume_path(ctx, config)
             if not resume_path or not os.path.exists(resume_path):
+                save_not_targeted(ctx, "no matching resume", config["role"])
                 print("  No matching resume found; skipping.")
                 skipped += 1
                 continue
             profile = get_or_build_profile(resume_path, gemini=gemini)
 
             if max_applicants and count is not None and count > max_applicants:
+                save_not_targeted(ctx, f"over {max_applicants}-applicant cap", config["role"])
                 print(f"  Over the {max_applicants}-applicant cap; skipping.")
                 skipped += 1
                 continue
@@ -415,6 +544,7 @@ def run(config):
                 continue
 
             if not click_easy_apply(page, timeout=8000):
+                save_not_targeted(ctx, "no Easy Apply button", config["role"])
                 print("  No Easy Apply button; skipping.")
                 skipped += 1
                 continue
@@ -430,8 +560,13 @@ def run(config):
 
             if sent:
                 applied += 1
+                if identifier:
+                    save_applied_id(identifier)
+                    applied_ids.add(identifier)
+                    print(f"  Tracked currentJobId: {identifier}")
                 print(f"  Applied ({applied}/{max_applications}).")
             else:
+                save_not_targeted(ctx, "application not submitted", config["role"])
                 skipped += 1
                 print("  Not submitted; moving on.")
                 dismiss_modal(page)
@@ -441,6 +576,7 @@ def run(config):
         print(f"\nDone. Applied to {applied} job(s), skipped {skipped}.")
         context.close()
         browser.close()
+        return total
 
 
 def main():
@@ -466,11 +602,30 @@ def main():
         if isinstance(configured_roles, list):
             roles = [str(role).strip() for role in configured_roles if str(role).strip()]
 
-    for role in roles:
-        role_config = dict(config)
-        role_config["role"] = role
-        print(f"\n=== Target role: {role} ===")
-        run(role_config)
+    links = load_links()
+    if links:
+        # links.txt is authoritative: its search URL already contains the
+        # user's combined role and location targeting.
+        for link in links:
+            for page_number in range(int(config.get("max_search_pages", 10))):
+                link_config = dict(config)
+                parsed_link = urllib.parse.urlsplit(link)
+                query = dict(urllib.parse.parse_qsl(parsed_link.query, keep_blank_values=True))
+                query["start"] = str(page_number * 25)
+                link_config["target_url"] = urllib.parse.urlunsplit(
+                    parsed_link._replace(query=urllib.parse.urlencode(query))
+                )
+                link_config["role"] = "roles from links.txt"
+                print(f"\n=== Target search link, page {page_number + 1}: {link_config['target_url']} ===")
+                total = run(link_config)
+                if not total:
+                    break
+    else:
+        for role in roles:
+            role_config = dict(config)
+            role_config["role"] = role
+            print(f"\n=== Target role: {role} ===")
+            run(role_config)
 
 
 if __name__ == "__main__":
