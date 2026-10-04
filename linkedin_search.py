@@ -458,7 +458,19 @@ def main():
     if args.max:
         config["max_applications"] = args.max
 
-    run(config)
+    # A positional role is an explicit one-role override. Otherwise, process
+    # each configured target independently so one search cannot hide the next.
+    roles = [config.get("role", "Software Engineer")]
+    if not args.role:
+        configured_roles = config.get("roles")
+        if isinstance(configured_roles, list):
+            roles = [str(role).strip() for role in configured_roles if str(role).strip()]
+
+    for role in roles:
+        role_config = dict(config)
+        role_config["role"] = role
+        print(f"\n=== Target role: {role} ===")
+        run(role_config)
 
 
 if __name__ == "__main__":

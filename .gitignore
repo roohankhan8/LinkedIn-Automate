@@ -11,3 +11,4 @@ qa_cache.json
 !templates/index.html
 dist*
 config.json
+error.log
