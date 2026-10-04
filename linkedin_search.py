@@ -9,6 +9,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from easy_apply import apply_to_current_job, dismiss_modal
@@ -167,16 +168,32 @@ def search_url(keywords, config):
 def open_jobs_search(page, keywords, config):
     url = search_url(keywords, config)
     print(f"Opening: {url}")
-    page.goto(url)
+    try:
+        # LinkedIn often keeps network requests open indefinitely. Waiting for
+        # the DOM is enough; the result list is hydrated below afterward.
+        page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=int(config.get("navigation_timeout_ms", 60000)),
+        )
+    except PlaywrightTimeoutError:
+        print("Navigation is still loading; continuing with the page received so far.")
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:
+    except PlaywrightTimeoutError:
         pass
     page.wait_for_timeout(config.get("page_load_wait_ms", 3000))
 
     if "/jobs/search-results/" in page.url:
         print("LinkedIn redirected to the SDUI results page; forcing the classic list.")
-        page.goto(url)
+        try:
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=int(config.get("navigation_timeout_ms", 60000)),
+            )
+        except PlaywrightTimeoutError:
+            print("Classic results are still loading; continuing with the page received so far.")
         page.wait_for_timeout(config.get("page_load_wait_ms", 3000))
 
     print(f"Jobs URL: {page.url}")

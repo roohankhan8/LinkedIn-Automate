@@ -15,6 +15,7 @@ RESUME_PROFILE_PATH = BASE_DIR / "resume_profile.json"
 QA_CACHE_PATH = BASE_DIR / "qa_cache.json"
 STATE_PATH = BASE_DIR / "linkedin_state.json"
 LOGIN_DONE_FLAG = BASE_DIR / "login_done.flag"
+ERROR_LOG_PATH = BASE_DIR / "error.log"
 
 app = Flask(__name__)
 
@@ -38,24 +39,27 @@ class Runner:
             self._error = False
 
         def run():
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=str(BASE_DIR),
-            )
-            with self._lock:
-                self.process = process
-            for line in process.stdout:
+            with open(ERROR_LOG_PATH, "w", encoding="utf-8") as error_log:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=str(BASE_DIR),
+                )
                 with self._lock:
-                    self.logs.append(line.rstrip())
-            process.wait()
-            with self._lock:
-                self.process = None
-                self._last_returncode = process.returncode
-                self._error = process.returncode != 0
-                self.current = None
+                    self.process = process
+                for line in process.stdout:
+                    error_log.write(line)
+                    error_log.flush()
+                    with self._lock:
+                        self.logs.append(line.rstrip())
+                process.wait()
+                with self._lock:
+                    self.process = None
+                    self._last_returncode = process.returncode
+                    self._error = process.returncode != 0
+                    self.current = None
 
         threading.Thread(target=run, daemon=True).start()
         return True

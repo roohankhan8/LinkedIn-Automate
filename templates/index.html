@@ -83,11 +83,17 @@
             </section>
 
             <section id="logs" class="tab-panel hidden">
-                <h2 class="text-2xl font-bold mb-4">Logs</h2>
+                <div class="flex items-center justify-between mb-2">
+                    <h2 class="text-2xl font-bold">Logs</h2>
+                    <button id="btn-copy-logs" class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700">Copy Logs</button>
+                </div>
                 <pre id="log-view" class="w-full h-[35vh] p-4 bg-slate-900 text-green-400 text-xs font-mono rounded-lg overflow-auto mb-4">No logs yet.</pre>
                 <div class="flex items-center justify-between mb-2">
                     <h3 class="text-lg font-semibold">Ollama Logs</h3>
-                    <button id="btn-ollama-logs" class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700">Load Ollama Logs</button>
+                    <div class="flex gap-2">
+                        <button id="btn-copy-ollama-logs" class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700">Copy Logs</button>
+                        <button id="btn-ollama-logs" class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700">Load Ollama Logs</button>
+                    </div>
                 </div>
                 <pre id="ollama-log-view" class="w-full h-[35vh] p-4 bg-slate-900 text-blue-300 text-xs font-mono rounded-lg overflow-auto">Click "Load Ollama Logs" to fetch.</pre>
             </section>

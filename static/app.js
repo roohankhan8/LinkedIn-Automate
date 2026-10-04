@@ -8,7 +8,9 @@
     const statusText = document.getElementById('status-text');
     const spinner = document.getElementById('spinner');
     const logView = document.getElementById('log-view');
+    const btnCopyLogs = document.getElementById('btn-copy-logs');
     const btnOllamaLogs = document.getElementById('btn-ollama-logs');
+    const btnCopyOllamaLogs = document.getElementById('btn-copy-ollama-logs');
     const ollamaLogView = document.getElementById('ollama-log-view');
     const errorBanner = document.getElementById('error-banner');
     const errorText = document.getElementById('error-text');
@@ -49,6 +51,24 @@
         } catch (e) {
             ollamaLogView.textContent = 'Error: ' + e.message;
         }
+    }
+
+    async function copyLog(view, button) {
+        const text = view.textContent;
+        try {
+            await navigator.clipboard.writeText(text);
+        } catch (e) {
+            const selection = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(view);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            document.execCommand('copy');
+            selection.removeAllRanges();
+        }
+        const label = button.textContent;
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = label; }, 1200);
     }
 
     async function getJSON(url) {
@@ -186,7 +206,9 @@
     btnLogin.addEventListener('click', startLogin);
     btnLoginDone.addEventListener('click', confirmLogin);
     btnSearch.addEventListener('click', startSearch);
+    btnCopyLogs.addEventListener('click', () => copyLog(logView, btnCopyLogs));
     btnOllamaLogs.addEventListener('click', loadOllamaLogs);
+    btnCopyOllamaLogs.addEventListener('click', () => copyLog(ollamaLogView, btnCopyOllamaLogs));
     document.getElementById('btn-save-config').addEventListener('click', saveConfig);
     document.getElementById('btn-save-env').addEventListener('click', saveEnv);
     document.getElementById('btn-save-resume').addEventListener('click', saveResume);
