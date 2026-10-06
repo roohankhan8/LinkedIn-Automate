@@ -1,6 +1,16 @@
 import unittest
+from datetime import date
 
-from job_intelligence import enabled_role_profiles, normalize_config, recency_filter
+from job_intelligence import (
+    canonical_job_url,
+    deduplicate_jobs,
+    enabled_role_profiles,
+    job_key,
+    merge_jobs,
+    normalize_config,
+    normalize_job,
+    recency_filter,
+)
 
 
 class JobIntelligenceConfigTests(unittest.TestCase):
@@ -82,6 +92,134 @@ class JobIntelligenceConfigTests(unittest.TestCase):
         )
 
         self.assertEqual([p["name"] for p in enabled_role_profiles(config)], ["Backend"])
+
+
+class JobNormalizationTests(unittest.TestCase):
+    def test_linkedin_id_is_preferred_and_url_is_canonical(self):
+        job = normalize_job(
+            {
+                "url": "https://www.linkedin.com/jobs/search/?currentJobId=123&trk=x",
+                "title": "Backend Engineer",
+            },
+            "Backend",
+        )
+
+        self.assertEqual(job["job_id"], "123")
+        self.assertEqual(job["url"], "https://www.linkedin.com/jobs/view/123")
+        self.assertEqual(job_key(job), "linkedin:123")
+
+    def test_canonical_url_strips_tracking_parameters(self):
+        url = canonical_job_url(
+            "https://www.linkedin.com/jobs/view/backend-engineer-at-acme-123/?trk=public&refId=x"
+        )
+
+        self.assertEqual(
+            url,
+            "https://www.linkedin.com/jobs/view/123",
+        )
+
+    def test_detail_key_normalizes_company_title_and_location(self):
+        job = normalize_job(
+            {
+                "title": " Backend Engineer ",
+                "company": "ACME, Inc.",
+                "location": "Karachi, Pakistan",
+            },
+            "Backend",
+        )
+
+        self.assertEqual(
+            job_key(job),
+            "details:acme inc|backend engineer|karachi pakistan",
+        )
+
+    def test_duplicate_observations_merge_roles_and_richer_fields(self):
+        jobs = deduplicate_jobs(
+            [
+                normalize_job(
+                    {
+                        "url": "https://www.linkedin.com/jobs/view/123",
+                        "title": "Backend Engineer",
+                        "applicant_count": 45,
+                    },
+                    "Backend Engineer",
+                ),
+                normalize_job(
+                    {
+                        "url": "https://www.linkedin.com/jobs/search/?currentJobId=123",
+                        "description": "Build APIs",
+                        "applicant_count": 42,
+                        "required_skills": ["Python"],
+                    },
+                    "AI Software Engineer",
+                ),
+            ]
+        )
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(
+            jobs[0]["matched_roles"],
+            ["Backend Engineer", "AI Software Engineer"],
+        )
+        self.assertEqual(jobs[0]["description"], "Build APIs")
+        self.assertEqual(jobs[0]["applicant_count"], 42)
+        self.assertEqual(jobs[0]["required_skills"], ["Python"])
+
+    def test_merge_unions_lists_without_reordering(self):
+        first = normalize_job(
+            {"url": "https://example.com/job", "required_skills": ["Python"]},
+            "Backend",
+        )
+        second = normalize_job(
+            {
+                "url": "https://example.com/job?source=feed",
+                "required_skills": ["Django", "Python"],
+                "responsibilities": ["Build APIs"],
+            },
+            "Python",
+        )
+
+        merged = merge_jobs(first, second)
+
+        self.assertEqual(merged["required_skills"], ["Python", "Django"])
+        self.assertEqual(merged["responsibilities"], ["Build APIs"])
+        self.assertEqual(merged["matched_roles"], ["Backend", "Python"])
+
+    def test_relative_posting_age_becomes_iso_date(self):
+        job = normalize_job(
+            {"posting_date": "5 days ago"},
+            "Backend",
+            today=date(2026, 10, 7),
+        )
+
+        self.assertEqual(job["posting_date"], "2026-10-02")
+
+    def test_normalized_job_contains_complete_schema(self):
+        job = normalize_job({}, "Backend")
+
+        self.assertEqual(
+            set(job),
+            {
+                "job_id",
+                "url",
+                "title",
+                "company",
+                "location",
+                "employment_type",
+                "workplace_type",
+                "seniority",
+                "posting_date",
+                "applicant_count",
+                "description",
+                "required_skills",
+                "preferred_skills",
+                "years_experience",
+                "education_requirement",
+                "responsibilities",
+                "application_method",
+                "matched_roles",
+            },
+        )
 
 
 if __name__ == "__main__":
