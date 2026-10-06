@@ -6,6 +6,8 @@ import re
 import urllib.parse
 from datetime import date, timedelta
 
+from gemini_client import GeminiError
+
 
 DEFAULT_FIT_SCORE_WEIGHTS = {
     "role_title": 20,
@@ -238,3 +240,184 @@ def deduplicate_jobs(jobs: list[dict]) -> list[dict]:
         key = job_key(job)
         unique[key] = merge_jobs(unique[key], job) if key in unique else job
     return list(unique.values())
+
+
+SKILL_ALIASES = {
+    "Python": ("python",),
+    "Django": ("django",),
+    "FastAPI": ("fastapi", "fast api"),
+    "Laravel": ("laravel",),
+    "PHP": ("php",),
+    "JavaScript": ("javascript",),
+    "TypeScript": ("typescript",),
+    "React": ("react", "react.js", "reactjs"),
+    "Node.js": ("node.js", "nodejs"),
+    "PostgreSQL": ("postgresql", "postgres"),
+    "MySQL": ("mysql",),
+    "MongoDB": ("mongodb",),
+    "SQL": ("sql",),
+    "Docker": ("docker",),
+    "Kubernetes": ("kubernetes", "k8s"),
+    "AWS": ("aws", "amazon web services"),
+    "Azure": ("azure",),
+    "GCP": ("gcp", "google cloud"),
+    "REST APIs": ("rest api", "restful api"),
+    "GraphQL": ("graphql",),
+    "Airflow": ("airflow",),
+    "Spark": ("spark",),
+    "LangChain": ("langchain",),
+    "LangGraph": ("langgraph",),
+    "RAG": ("retrieval augmented generation", "rag"),
+}
+
+JOB_ANALYSIS_KEYS = {
+    "required_skills",
+    "preferred_skills",
+    "years_experience",
+    "education_requirement",
+    "responsibilities",
+    "employment_type",
+    "workplace_type",
+    "seniority",
+}
+
+
+def _skills_in(text: str) -> list[str]:
+    lowered = text.lower()
+    found = []
+    for canonical, aliases in SKILL_ALIASES.items():
+        if any(re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", lowered) for alias in aliases):
+            found.append(canonical)
+    return found
+
+
+def deterministic_job_analysis(job: dict) -> dict:
+    description = job.get("description") or ""
+    required = list(job.get("required_skills") or [])
+    preferred = list(job.get("preferred_skills") or [])
+    responsibilities = list(job.get("responsibilities") or [])
+    mode = "required"
+    for raw_line in description.splitlines():
+        line = raw_line.strip().lstrip("•-* ")
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith(("preferred", "nice to have", "bonus")):
+            mode = "preferred"
+        elif lowered.startswith(("responsibilities", "what you'll do", "what you will do")):
+            mode = "responsibilities"
+            line = line.split(":", 1)[1].strip() if ":" in line else ""
+        elif lowered.startswith(("requirements", "required", "qualifications")):
+            mode = "required"
+        if line:
+            skills = _skills_in(line)
+            if mode == "preferred":
+                preferred.extend(skills)
+            elif mode == "required":
+                required.extend(skills)
+            elif re.match(r"(?i)^(build|develop|design|implement|maintain|create|collaborate|lead)\b", line):
+                responsibilities.append(line)
+
+    years = job.get("years_experience")
+    if years is None:
+        match = re.search(r"(\d+(?:\.\d+)?)\+?\s*(?:years?|yrs?)\b", description, re.I)
+        years = float(match.group(1)) if match and "." in match.group(1) else int(match.group(1)) if match else None
+
+    education = job.get("education_requirement")
+    if education is None:
+        if re.search(r"bachelor(?:'s)?\s+degree", description, re.I):
+            education = "Bachelor's degree"
+        elif re.search(r"master(?:'s)?\s+degree", description, re.I):
+            education = "Master's degree"
+
+    title_text = f"{job.get('title') or ''} {job.get('seniority') or ''}".lower()
+    seniority = job.get("seniority")
+    if not seniority:
+        if "senior" in title_text or "lead" in title_text:
+            seniority = "Senior"
+        elif "junior" in title_text or "entry" in title_text:
+            seniority = "Entry level"
+        elif "intern" in title_text:
+            seniority = "Internship"
+
+    workplace = job.get("workplace_type")
+    if not workplace and "remote" in (job.get("location") or "").lower():
+        workplace = "Remote"
+
+    return {
+        "required_skills": list(dict.fromkeys(required)),
+        "preferred_skills": list(dict.fromkeys(preferred)),
+        "years_experience": years,
+        "education_requirement": education,
+        "responsibilities": list(dict.fromkeys(responsibilities)),
+        "employment_type": job.get("employment_type"),
+        "workplace_type": workplace,
+        "seniority": seniority,
+    }
+
+
+def validate_job_analysis(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("AI analysis must be a JSON object")
+    unexpected = set(value) - JOB_ANALYSIS_KEYS
+    if unexpected:
+        raise ValueError(f"AI analysis contains unexpected fields: {sorted(unexpected)}")
+    result = {}
+    for key in ("required_skills", "preferred_skills", "responsibilities"):
+        item = value.get(key, [])
+        if not isinstance(item, list) or not all(isinstance(entry, str) for entry in item):
+            raise ValueError(f"AI analysis field {key} must be a list of strings")
+        result[key] = list(dict.fromkeys(entry.strip() for entry in item if entry.strip()))
+    years = value.get("years_experience")
+    if years is not None and (isinstance(years, bool) or not isinstance(years, (int, float)) or years < 0):
+        raise ValueError("AI analysis years_experience must be a non-negative number or null")
+    result["years_experience"] = years
+    for key in ("education_requirement", "employment_type", "workplace_type", "seniority"):
+        item = value.get(key)
+        if item is not None and not isinstance(item, str):
+            raise ValueError(f"AI analysis field {key} must be a string or null")
+        result[key] = item.strip() if isinstance(item, str) and item.strip() else None
+    return result
+
+
+JOB_ANALYSIS_SYSTEM = (
+    "Extract only requirements explicitly supported by the supplied job description. "
+    "Return a JSON object using only the requested fields. Use null or empty lists when unknown."
+)
+
+
+def analyze_job(job: dict, gemini=None) -> dict:
+    deterministic = deterministic_job_analysis(job)
+    result = {**job, **deterministic, "analysis_concerns": []}
+    incomplete = any(
+        not deterministic.get(key)
+        for key in (
+            "required_skills",
+            "responsibilities",
+            "years_experience",
+            "education_requirement",
+        )
+    )
+    if not gemini or not incomplete:
+        return result
+
+    prompt = (
+        "Analyze this job and return exactly these fields: required_skills, "
+        "preferred_skills, years_experience, education_requirement, responsibilities, "
+        "employment_type, workplace_type, seniority.\n\n"
+        f"{job.get('title', '')}\n{job.get('location', '')}\n{job.get('description', '')}"
+    )
+    try:
+        semantic = validate_job_analysis(
+            gemini.generate_json_object(prompt, system=JOB_ANALYSIS_SYSTEM)
+        )
+    except (GeminiError, TypeError, ValueError) as exc:
+        result["analysis_concerns"].append(f"AI analysis rejected: {exc}")
+        return result
+
+    for key in ("required_skills", "preferred_skills", "responsibilities"):
+        result[key] = list(dict.fromkeys((result.get(key) or []) + semantic[key]))
+    for key in ("years_experience", "education_requirement", "employment_type", "workplace_type", "seniority"):
+        if not result.get(key) and semantic.get(key) is not None:
+            result[key] = semantic[key]
+    return result

@@ -87,6 +87,12 @@ class Gemini:
             text = self._gemini_generate(prompt, system=system, temperature=temperature, json=True)
         return _parse_json(text)
 
+    def generate_json_object(self, prompt, system=None, temperature=0.1):
+        result = self.generate_json(prompt, system=system, temperature=temperature)
+        if not isinstance(result, dict):
+            raise GeminiError("LLM response must be a JSON object")
+        return result
+
     def _gemini_generate(self, prompt, system=None, temperature=0.2, json=False):
         config = types.GenerateContentConfig(temperature=temperature)
         if system:

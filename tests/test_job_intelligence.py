@@ -1,9 +1,12 @@
 import unittest
 from datetime import date
+from unittest.mock import Mock
 
 from job_intelligence import (
+    analyze_job,
     canonical_job_url,
     deduplicate_jobs,
+    deterministic_job_analysis,
     enabled_role_profiles,
     job_key,
     merge_jobs,
@@ -220,6 +223,82 @@ class JobNormalizationTests(unittest.TestCase):
                 "matched_roles",
             },
         )
+
+
+class JobAnalysisTests(unittest.TestCase):
+    def test_extracts_deterministic_requirements(self):
+        job = normalize_job(
+            {
+                "title": "Senior Backend Engineer",
+                "description": (
+                    "Requirements:\n"
+                    "3+ years of experience with Python, Django, and PostgreSQL.\n"
+                    "Bachelor's degree in Computer Science.\n"
+                    "Preferred: Docker and AWS.\n"
+                    "Responsibilities:\nBuild REST APIs and database services."
+                ),
+            },
+            "Backend Engineer",
+        )
+
+        result = deterministic_job_analysis(job)
+
+        self.assertEqual(result["years_experience"], 3)
+        self.assertEqual(result["seniority"], "Senior")
+        self.assertEqual(result["required_skills"], ["Python", "Django", "PostgreSQL"])
+        self.assertEqual(result["preferred_skills"], ["Docker", "AWS"])
+        self.assertEqual(result["education_requirement"], "Bachelor's degree")
+        self.assertEqual(result["responsibilities"], ["Build REST APIs and database services."])
+
+    def test_description_remote_word_does_not_set_workplace_type(self):
+        job = normalize_job(
+            {
+                "location": "Lahore, Pakistan",
+                "description": "Collaborate with remote teams around the world.",
+            },
+            "Backend",
+        )
+
+        self.assertIsNone(deterministic_job_analysis(job)["workplace_type"])
+
+    def test_malformed_ai_analysis_keeps_deterministic_data(self):
+        gemini = Mock()
+        gemini.generate_json_object.return_value = {"required_skills": "Python"}
+        job = normalize_job(
+            {"description": "Requirements: Python."},
+            "Backend",
+        )
+
+        result = analyze_job(job, gemini)
+
+        self.assertIn("Python", result["required_skills"])
+        self.assertTrue(
+            any("AI analysis" in concern for concern in result["analysis_concerns"])
+        )
+
+    def test_valid_ai_analysis_only_fills_semantic_fields(self):
+        gemini = Mock()
+        gemini.generate_json_object.return_value = {
+            "required_skills": ["FastAPI"],
+            "preferred_skills": ["Docker"],
+            "years_experience": 2,
+            "education_requirement": None,
+            "responsibilities": ["Build APIs"],
+            "employment_type": "Full-time",
+            "workplace_type": "Remote",
+            "seniority": "Mid level",
+        }
+        job = normalize_job(
+            {"job_id": "123", "title": "API Engineer", "description": "Build services."},
+            "Backend",
+        )
+
+        result = analyze_job(job, gemini)
+
+        self.assertEqual(result["job_id"], "123")
+        self.assertEqual(result["required_skills"], ["FastAPI"])
+        self.assertEqual(result["workplace_type"], "Remote")
+        self.assertEqual(result["analysis_concerns"], [])
 
 
 if __name__ == "__main__":
