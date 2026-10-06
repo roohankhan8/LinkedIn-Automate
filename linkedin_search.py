@@ -277,6 +277,7 @@ def choose_resume_path(ctx, config):
         "backend": ("backend", "back-end", "django", "fastapi", "api", "server"),
         "frontend": ("frontend", "front-end", "react", "vue", "javascript", "ui", "web"),
         "fullstack": ("fullstack", "full-stack", "full stack", "mern", "node"),
+        "dataengineer": ("data engineer", "data pipeline", "etl", "airflow", "spark", "warehouse"),
         "dataanalyst": ("data analyst", "data analysis", "sql", "analytics", "bi analyst"),
         "softwareengineer": ("software engineer", "software developer", "engineering", "developer"),
         "fde": ("founding", "founder", "early stage", "full-stack", "backend", "frontend"),
