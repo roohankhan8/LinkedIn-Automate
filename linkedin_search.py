@@ -14,6 +14,7 @@ from playwright.sync_api import sync_playwright
 
 from easy_apply import apply_to_current_job, dismiss_modal
 from gemini_client import Gemini, GeminiError
+from job_intelligence import normalize_config, recency_filter
 from qa_store import QAStore
 from resume_profile import get_or_build_profile
 
@@ -87,7 +88,7 @@ def load_config(path="config.json"):
         print(f"{path} not found. Create it first.")
         sys.exit(1)
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return normalize_config(json.load(f))
 
 
 def first_visible(scope, selectors, limit=10):
@@ -162,8 +163,7 @@ def search_url(keywords, config):
     and no anchor. /jobs/search/ still serves the classic, automatable DOM.
     """
     params = {"keywords": keywords, "f_AL": "true"}
-    if config.get("past_24_hours", True):
-        params["f_TPR"] = "r86400"
+    params["f_TPR"] = recency_filter(config.get("posted_within_days", 7))
     if config.get("location"):
         params["location"] = config["location"]
     return "https://www.linkedin.com/jobs/search/?" + urllib.parse.urlencode(params)
