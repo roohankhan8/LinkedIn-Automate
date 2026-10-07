@@ -9,10 +9,13 @@ from job_intelligence import (
     deterministic_job_analysis,
     enabled_role_profiles,
     job_key,
+    location_points,
     merge_jobs,
     normalize_config,
     normalize_job,
     recency_filter,
+    rank_jobs,
+    score_job,
 )
 
 
@@ -299,6 +302,141 @@ class JobAnalysisTests(unittest.TestCase):
         self.assertEqual(result["required_skills"], ["FastAPI"])
         self.assertEqual(result["workplace_type"], "Remote")
         self.assertEqual(result["analysis_concerns"], [])
+
+
+class JobFitScoringTests(unittest.TestCase):
+    def setUp(self):
+        self.config = normalize_config({"role": "Backend Engineer"})
+        self.roles = enabled_role_profiles(self.config)
+        self.profile = {
+            "skills": ["Python", "Django", "REST API", "PostgreSQL", "Docker", "AWS", "LangChain"],
+            "skill_years": {"Python": 3, "Django": 2},
+            "roles": ["Backend Engineer"],
+            "total_years_experience": 3,
+            "target_role_categories": ["backend", "ai"],
+        }
+
+    def test_location_points_follow_requested_order(self):
+        cases = [
+            ({"location": "Karachi, Pakistan", "workplace_type": "On-site"}, 10),
+            ({"location": "Pakistan", "workplace_type": "Remote"}, 9),
+            ({"location": "Islamabad, Pakistan", "workplace_type": "Hybrid"}, 7),
+            ({"location": "Dubai, UAE", "workplace_type": "Remote"}, 5),
+            ({"location": "Dubai, UAE", "workplace_type": "On-site"}, 0),
+        ]
+
+        for job, expected in cases:
+            with self.subTest(job=job):
+                self.assertEqual(location_points(job, self.config)[0], expected)
+
+    def test_unknown_location_scores_zero_and_adds_concern(self):
+        points, concerns = location_points({"location": "", "workplace_type": None}, self.config)
+
+        self.assertEqual(points, 0)
+        self.assertIn("location/workplace unavailable", concerns)
+
+    def test_score_is_sum_of_visible_components(self):
+        job = {
+            "title": "AI Backend Engineer",
+            "company": "Example",
+            "location": "Karachi, Pakistan",
+            "workplace_type": "Hybrid",
+            "required_skills": ["Python", "Django", "REST APIs"],
+            "preferred_skills": ["Docker"],
+            "years_experience": 3,
+            "seniority": "Mid level",
+            "description": "Build AI APIs with PostgreSQL on AWS",
+            "responsibilities": ["Build database-backed APIs"],
+            "matched_roles": ["Backend Engineer"],
+        }
+
+        result = score_job(job, self.profile, self.roles, self.config)
+
+        self.assertEqual(
+            result["score"],
+            sum(component["earned"] for component in result["components"].values()),
+        )
+        self.assertEqual(
+            sum(component["maximum"] for component in result["components"].values()),
+            100,
+        )
+        self.assertEqual(result["tier"], "A")
+
+    def test_unknown_required_skills_do_not_receive_assumed_points(self):
+        job = {
+            "title": "Backend Engineer",
+            "company": "Example",
+            "location": "Karachi, Pakistan",
+            "workplace_type": "On-site",
+            "required_skills": [],
+            "preferred_skills": [],
+            "years_experience": None,
+            "description": "",
+            "responsibilities": [],
+            "matched_roles": ["Backend Engineer"],
+        }
+
+        result = score_job(job, self.profile, self.roles, self.config)
+
+        self.assertEqual(result["components"]["required_skills"]["earned"], 0)
+        self.assertIn("requirements unavailable", result["concerns"])
+
+    def test_thresholds_produce_b_and_c_tiers(self):
+        job = {
+            "title": "Backend Engineer",
+            "company": "Example",
+            "location": "Dubai, UAE",
+            "workplace_type": "On-site",
+            "required_skills": ["Python"],
+            "preferred_skills": [],
+            "years_experience": None,
+            "description": "Build backend APIs",
+            "responsibilities": [],
+            "matched_roles": ["Backend Engineer"],
+        }
+        score = score_job(job, self.profile, self.roles, self.config)["score"]
+        b_config = normalize_config(
+            {
+                "target_roles": [{"name": "Backend Engineer", "minimum_fit_score": score}],
+                "minimum_fit_score": score,
+                "stretch_fit_score": max(0, score - 10),
+            }
+        )
+        c_config = normalize_config(
+            {
+                "target_roles": [{"name": "Backend Engineer", "minimum_fit_score": min(100, score + 1)}],
+                "minimum_fit_score": min(100, score + 1),
+                "stretch_fit_score": score,
+            }
+        )
+
+        self.assertLess(score, 80)
+        self.assertEqual(score_job(job, self.profile, enabled_role_profiles(b_config), b_config)["tier"], "B")
+        self.assertEqual(score_job(job, self.profile, enabled_role_profiles(c_config), c_config)["tier"], "C")
+
+    def test_preferred_company_breaks_tie_without_changing_score(self):
+        config = {**self.config, "preferred_companies": ["Preferred Co"]}
+        jobs = [
+            {"job": {"company": "Other Co", "posting_date": "2026-10-07", "applicant_count": 10}, "fit": {"score": 70, "tier": "B"}, "role_priority": 1},
+            {"job": {"company": "Preferred Co", "posting_date": "2026-10-07", "applicant_count": 10}, "fit": {"score": 70, "tier": "B"}, "role_priority": 1},
+        ]
+
+        ranked = rank_jobs(jobs, config)
+
+        self.assertEqual(ranked[0]["job"]["company"], "Preferred Co")
+        self.assertEqual([item["fit"]["score"] for item in ranked], [70, 70])
+
+    def test_excluded_company_is_removed(self):
+        config = {**self.config, "excluded_companies": ["Blocked Co"]}
+        jobs = [
+            {"job": {"company": "Blocked Co"}, "fit": {"score": 100, "tier": "A"}, "role_priority": 1},
+            {"job": {"company": "Allowed Co"}, "fit": {"score": 60, "tier": "C"}, "role_priority": 3},
+        ]
+
+        self.assertEqual(
+            [item["job"]["company"] for item in rank_jobs(jobs, config)],
+            ["Allowed Co"],
+        )
 
 
 if __name__ == "__main__":

@@ -549,3 +549,208 @@ def rank_resumes(job: dict, resume_profiles: dict[str, dict]) -> list[dict]:
             }
         )
     return sorted(results, key=lambda item: (-item["score"], item["path"].lower()))
+
+
+def location_points(job: dict, config: dict) -> tuple[int, list[str]]:
+    location = (job.get("location") or "").lower()
+    workplace = (job.get("workplace_type") or "").lower()
+    if not location and not workplace:
+        return 0, ["location/workplace unavailable"]
+    if "karachi" in location or "karāchi" in location:
+        return 10, []
+    if "pakistan" in location and "remote" in workplace:
+        return 9, []
+    if "pakistan" in location:
+        return 7, []
+    if config.get("remote", True) and "remote" in workplace:
+        return 5, []
+    return 0, ["location is not compatible"]
+
+
+def _profile_skills(profile: dict) -> set[str]:
+    return {
+        canonical_skill(skill)
+        for skill in list(profile.get("skills") or [])
+        + list((profile.get("skill_years") or {}).keys())
+    }
+
+
+def _component(earned, maximum, evidence=None):
+    return {
+        "earned": int(round(max(0, min(maximum, earned)))),
+        "maximum": maximum,
+        "evidence": evidence or [],
+    }
+
+
+def score_job(job: dict, resume_profile: dict, role_profiles: list[dict], config: dict) -> dict:
+    weights = config.get("fit_score_weights", DEFAULT_FIT_SCORE_WEIGHTS)
+    available = _profile_skills(resume_profile)
+    required = job.get("required_skills") or []
+    preferred = job.get("preferred_skills") or []
+    strong, partial, missing_required, missing_preferred = [], [], [], []
+    required_credit = 0.0
+    for skill in required:
+        canonical = canonical_skill(skill)
+        if canonical in available:
+            strong.append(skill)
+            required_credit += 1
+        elif _related_skill(canonical, available):
+            partial.append(skill)
+            required_credit += 0.5
+        else:
+            missing_required.append(skill)
+    for skill in preferred:
+        canonical = canonical_skill(skill)
+        if canonical in available:
+            strong.append(skill)
+        elif _related_skill(canonical, available):
+            partial.append(skill)
+        else:
+            missing_preferred.append(skill)
+
+    role_texts = [job.get("title"), *(job.get("matched_roles") or [])]
+    configured_role_texts = []
+    for profile in role_profiles:
+        configured_role_texts.extend([profile.get("name"), *(profile.get("keywords") or [])])
+    role_overlap = _role_tokens(role_texts).intersection(_role_tokens(configured_role_texts))
+
+    job_text = " ".join(
+        [
+            job.get("title") or "",
+            job.get("description") or "",
+            *(job.get("responsibilities") or []),
+            *required,
+            *preferred,
+        ]
+    ).lower()
+    backend_terms = {"backend", "api", "django", "fastapi", "laravel", "server"}
+    profile_text = " ".join(
+        [
+            *(resume_profile.get("roles") or []),
+            *(resume_profile.get("target_role_categories") or []),
+            *available,
+        ]
+    ).lower()
+    backend_job = any(term in job_text for term in backend_terms)
+    backend_profile = any(term in profile_text for term in backend_terms)
+
+    required_years = job.get("years_experience")
+    candidate_years = resume_profile.get("total_years_experience")
+    if required_years is None:
+        experience_ratio = 0.5
+        experience_evidence = ["job experience requirement unavailable"]
+    elif isinstance(candidate_years, (int, float)) and candidate_years >= required_years:
+        experience_ratio = 1
+        experience_evidence = [f"{candidate_years} years meets {required_years}"]
+    elif isinstance(candidate_years, (int, float)) and candidate_years >= required_years - 1:
+        experience_ratio = 0.7
+        experience_evidence = [f"{candidate_years} years is within one year of {required_years}"]
+    else:
+        experience_ratio = 0
+        experience_evidence = [f"experience below {required_years} years"]
+
+    location_base, location_concerns = location_points(job, config)
+    ai_job = bool(re.search(r"\b(ai|llm)\b|generative|machine learning", job_text))
+    ai_profile = any(skill in available for skill in {"langchain", "langgraph", "rag"}) or "ai" in profile_text
+    database_terms = {"postgresql", "mysql", "mongodb", "sql", "database", "airflow", "spark"}
+    database_job = any(term in job_text for term in database_terms)
+    database_profile = bool(available.intersection(database_terms))
+    cloud_terms = {"aws", "azure", "gcp", "docker", "kubernetes", "cloud"}
+    cloud_job = any(term in job_text for term in cloud_terms)
+    cloud_profile = bool(available.intersection(cloud_terms))
+
+    components = {
+        "role_title": _component(weights["role_title"] if role_overlap else 0, weights["role_title"], sorted(role_overlap)),
+        "required_skills": _component(
+            weights["required_skills"] * required_credit / len(required) if required else 0,
+            weights["required_skills"],
+            strong + partial,
+        ),
+        "backend_api": _component(
+            weights["backend_api"] if backend_job and backend_profile else 0,
+            weights["backend_api"],
+            ["backend/API job and resume evidence"] if backend_job and backend_profile else [],
+        ),
+        "experience_seniority": _component(
+            weights["experience_seniority"] * experience_ratio,
+            weights["experience_seniority"],
+            experience_evidence,
+        ),
+        "location_workplace": _component(
+            weights["location_workplace"] * location_base / 10,
+            weights["location_workplace"],
+            [job.get("location") or "unknown"],
+        ),
+        "ai": _component(weights["ai"] if ai_job and ai_profile else 0, weights["ai"], ["AI relevance"] if ai_job and ai_profile else []),
+        "database_data": _component(
+            weights["database_data"] if database_job and database_profile else 0,
+            weights["database_data"],
+            ["database/data relevance"] if database_job and database_profile else [],
+        ),
+        "cloud_infrastructure": _component(
+            weights["cloud_infrastructure"] if cloud_job and cloud_profile else 0,
+            weights["cloud_infrastructure"],
+            ["cloud/infrastructure relevance"] if cloud_job and cloud_profile else [],
+        ),
+    }
+    score = max(0, min(100, sum(component["earned"] for component in components.values())))
+    concerns = list(job.get("analysis_concerns") or []) + location_concerns
+    if not required:
+        concerns.append("requirements unavailable")
+    if "senior" in str(job.get("seniority") or "").lower() and (
+        not isinstance(candidate_years, (int, float)) or candidate_years < 5
+    ):
+        concerns.append("seniority may exceed documented experience")
+
+    matched_names = set(job.get("matched_roles") or [])
+    thresholds = [
+        profile.get("minimum_fit_score", config.get("minimum_fit_score", 70))
+        for profile in role_profiles
+        if not matched_names or profile.get("name") in matched_names
+    ]
+    minimum = min(thresholds) if thresholds else config.get("minimum_fit_score", 70)
+    stretch = config.get("stretch_fit_score", 60)
+    tier = "A" if score >= 80 else "B" if score >= minimum else "C" if score >= stretch else "D"
+    summary = [f"{name} {value['earned']}/{value['maximum']}" for name, value in components.items() if value["earned"]]
+    return {
+        "score": score,
+        "tier": tier,
+        "components": components,
+        "strong_matches": list(dict.fromkeys(strong)),
+        "partial_matches": list(dict.fromkeys(partial)),
+        "missing_required": missing_required,
+        "missing_preferred": missing_preferred,
+        "concerns": list(dict.fromkeys(concerns)),
+        "reasoning": f"{score}/100: " + (", ".join(summary) if summary else "no scored alignment"),
+    }
+
+
+def rank_jobs(scored_jobs: list[dict], config: dict) -> list[dict]:
+    excluded = {_identity_text(company) for company in config.get("excluded_companies", [])}
+    preferred = {_identity_text(company) for company in config.get("preferred_companies", [])}
+
+    def ordinal(value):
+        try:
+            return date.fromisoformat(value).toordinal()
+        except (TypeError, ValueError):
+            return 0
+
+    filtered = [
+        item
+        for item in scored_jobs
+        if _identity_text(item.get("job", {}).get("company")) not in excluded
+    ]
+    return sorted(
+        filtered,
+        key=lambda item: (
+            0 if item.get("fit", {}).get("tier") in ("A", "B") else 1,
+            -item.get("fit", {}).get("score", 0),
+            item.get("role_priority", 99),
+            -ordinal(item.get("job", {}).get("posting_date")),
+            item.get("job", {}).get("applicant_count")
+            if item.get("job", {}).get("applicant_count") is not None
+            else float("inf"),
+            -int(_identity_text(item.get("job", {}).get("company")) in preferred),
+        ),
+    )
