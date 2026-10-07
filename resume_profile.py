@@ -1,13 +1,18 @@
-"""Extract a structured profile from the resume PDF once and cache it as JSON."""
+"""Extract factual resume profiles and cache each one by content hash."""
 
+import hashlib
 import json
 import os
+import tempfile
+from pathlib import Path
 
 from pypdf import PdfReader
 
 from gemini_client import Gemini
 
 PROFILE_PATH = "resume_profile.json"
+PROFILE_CACHE_DIR = Path(__file__).resolve().parent / "resume_profiles"
+PROFILE_SCHEMA_VERSION = 2
 
 EXTRACTION_SYSTEM = (
     "You extract structured facts from resumes for filling out job application forms. "
@@ -41,7 +46,14 @@ EXTRACTION_PROMPT = """Extract the following fields from this resume and return 
   "graduation_year": number|null,
   "skills": [string],
   "skill_years": {{"skill name": number}},
+  "roles": [string],
+  "experience": [object],
+  "domains": [string],
+  "projects": [object],
+  "education": [object],
   "certifications": [string],
+  "keywords": [string],
+  "target_role_categories": [string],
   "languages": [string],
   "work_authorization": string|null,
   "requires_visa_sponsorship": boolean|null,
@@ -86,18 +98,20 @@ def build_profile(resume_path, gemini=None):
     print(f"Extracted {len(resume_text)} characters. Asking Gemini for structured insights...")
 
     gemini = gemini or Gemini()
-    profile = gemini.generate_json(
+    profile = gemini.generate_json_object(
         EXTRACTION_PROMPT.format(resume_text=resume_text[:60000]),
         system=EXTRACTION_SYSTEM,
     )
-    profile["_resume_path"] = os.path.abspath(resume_path)
+    profile = validate_resume_profile(profile)
+    profile["_schema_version"] = PROFILE_SCHEMA_VERSION
+    profile["_resume_path"] = str(Path(resume_path).resolve())
+    profile["_resume_sha256"] = resume_digest(resume_path)
     profile["_resume_text"] = resume_text[:20000]
     return profile
 
 
 def save_profile(profile, path=PROFILE_PATH):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(profile, f, indent=2, ensure_ascii=False)
+    _atomic_save_profile(profile, Path(path))
     print(f"Profile saved to {path}")
 
 
@@ -108,21 +122,106 @@ def load_profile(path=PROFILE_PATH):
         return json.load(f)
 
 
-def get_or_build_profile(resume_path, force=False, gemini=None):
-    """Return the cached profile, rebuilding it if missing, stale, or forced."""
-    profile = load_profile()
-    if profile and not force:
-        cached = profile.get("_resume_path")
-        if cached and os.path.abspath(resume_path) == cached:
-            print(f"Using cached resume profile from {PROFILE_PATH}")
-            return profile
-        print("Cached profile was built from a different resume; rebuilding.")
+def resume_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
+
+def profile_cache_path(resume_path, cache_dir=PROFILE_CACHE_DIR):
+    return Path(cache_dir) / f"{resume_digest(resume_path)}.json"
+
+
+PROFILE_LIST_FIELDS = {
+    "skills",
+    "roles",
+    "experience",
+    "domains",
+    "projects",
+    "education",
+    "certifications",
+    "languages",
+    "keywords",
+    "target_role_categories",
+}
+
+
+def validate_resume_profile(value):
+    if not isinstance(value, dict):
+        raise ValueError("resume profile must be a JSON object")
+    profile = dict(value)
+    for key in PROFILE_LIST_FIELDS:
+        item = profile.get(key, [])
+        if not isinstance(item, list):
+            raise ValueError(f"resume profile field {key} must be a list")
+        profile[key] = item
+    skill_years = profile.get("skill_years", {})
+    if not isinstance(skill_years, dict):
+        raise ValueError("resume profile field skill_years must be an object")
+    if any(
+        not isinstance(key, str)
+        or isinstance(years, bool)
+        or not isinstance(years, (int, float))
+        or years < 0
+        for key, years in skill_years.items()
+    ):
+        raise ValueError("resume profile skill_years must map skills to non-negative numbers")
+    profile["skill_years"] = skill_years
+    return profile
+
+
+def _atomic_save_profile(profile, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False
+    )
+    try:
+        with handle:
+            json.dump(profile, handle, indent=2, ensure_ascii=False)
+        os.replace(handle.name, path)
+    except Exception:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+
+
+def _decorate_cached_profile(profile, resume_path, digest):
+    profile = validate_resume_profile(profile)
+    profile["_schema_version"] = PROFILE_SCHEMA_VERSION
+    profile["_resume_path"] = str(Path(resume_path).resolve())
+    profile["_resume_sha256"] = digest
+    return profile
+
+
+def get_or_build_profile(resume_path, force=False, gemini=None, cache_dir=PROFILE_CACHE_DIR):
+    """Return this resume's cached profile, rebuilding only when its bytes change."""
     if not os.path.exists(resume_path):
         raise FileNotFoundError(f"Resume not found: {resume_path}")
 
+    digest = resume_digest(resume_path)
+    cache_path = Path(cache_dir) / f"{digest}.json"
+    if cache_path.exists() and not force:
+        profile = validate_resume_profile(json.loads(cache_path.read_text(encoding="utf-8")))
+        if profile.get("_resume_sha256") == digest:
+            print(f"Using cached resume profile from {cache_path}")
+            return profile
+
+    if not force:
+        legacy = load_profile(PROFILE_PATH)
+        cached_path = legacy.get("_resume_path") if isinstance(legacy, dict) else None
+        if cached_path and os.path.normcase(os.path.abspath(resume_path)) == os.path.normcase(cached_path):
+            profile = _decorate_cached_profile(legacy, resume_path, digest)
+            _atomic_save_profile(profile, cache_path)
+            print(f"Imported legacy resume profile into {cache_path}")
+            return profile
+
     profile = build_profile(resume_path, gemini=gemini)
-    save_profile(profile)
+    _atomic_save_profile(profile, cache_path)
+    print(f"Profile saved to {cache_path}")
     return profile
 
 
