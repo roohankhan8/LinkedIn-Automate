@@ -1,6 +1,7 @@
 import unittest
 from datetime import date
 from unittest.mock import Mock
+from unittest.mock import patch
 
 from job_intelligence import (
     analyze_job,
@@ -17,6 +18,7 @@ from job_intelligence import (
     rank_jobs,
     score_job,
 )
+from linkedin_search import apply_ranked_jobs, discover_jobs, job_id, prepare_ranked_jobs
 
 
 class JobIntelligenceConfigTests(unittest.TestCase):
@@ -437,6 +439,151 @@ class JobFitScoringTests(unittest.TestCase):
             [item["job"]["company"] for item in rank_jobs(jobs, config)],
             ["Allowed Co"],
         )
+
+
+class SearchOrchestrationTests(unittest.TestCase):
+    def test_job_id_accepts_normalized_job_and_canonical_url(self):
+        self.assertEqual(
+            job_id({"job_id": "123", "url": "https://www.linkedin.com/jobs/view/123"}),
+            "123",
+        )
+
+    def test_discovery_deduplicates_across_profiles_before_analysis(self):
+        config = normalize_config(
+            {
+                "target_roles": [
+                    {"name": "Backend Engineer", "priority": 1, "keywords": ["backend"]},
+                    {"name": "AI Software Engineer", "priority": 2, "keywords": ["ai"]},
+                ],
+                "max_search_pages": 1,
+            }
+        )
+        observations = [
+            [normalize_job({"job_id": "123", "title": "Backend Engineer"}, "Backend Engineer")],
+            [normalize_job({"job_id": "123", "description": "Build AI APIs"}, "AI Software Engineer")],
+        ]
+
+        with (
+            patch("linkedin_search.load_links", return_value=[]),
+            patch("linkedin_search._collect_current_search", side_effect=observations) as collect,
+        ):
+            jobs = discover_jobs(Mock(), config)
+
+        self.assertEqual(collect.call_count, 2)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(
+            jobs[0]["matched_roles"],
+            ["Backend Engineer", "AI Software Engineer"],
+        )
+
+    def test_disabled_profiles_are_not_searched(self):
+        config = normalize_config(
+            {
+                "target_roles": [
+                    {"name": "Backend", "priority": 1, "keywords": [], "enabled": True},
+                    {"name": "Frontend", "priority": 1, "keywords": [], "enabled": False},
+                ],
+                "max_search_pages": 1,
+            }
+        )
+
+        with (
+            patch("linkedin_search.load_links", return_value=[]),
+            patch("linkedin_search._collect_current_search", return_value=[]) as collect,
+        ):
+            discover_jobs(Mock(), config)
+
+        self.assertEqual(collect.call_count, 1)
+        self.assertEqual(collect.call_args.args[1]["name"], "Backend")
+
+    def test_links_file_remains_a_discovery_source(self):
+        config = normalize_config({"role": "Backend", "max_search_pages": 1})
+
+        with (
+            patch("linkedin_search.load_links", return_value=["https://linkedin.test/search"]),
+            patch("linkedin_search._collect_current_search", return_value=[]) as collect,
+        ):
+            discover_jobs(Mock(), config)
+
+        profile = collect.call_args.args[1]
+        self.assertEqual(profile["name"], "roles from links.txt")
+        self.assertEqual(profile["target_url"], "https://linkedin.test/search")
+
+    def test_ranked_pipeline_uses_selected_resume_profile(self):
+        config = normalize_config({"role": "Backend Engineer"})
+        backend = {
+            "skills": ["Python", "Django", "REST API"],
+            "skill_years": {"Python": 3},
+            "roles": ["Backend Engineer"],
+            "total_years_experience": 3,
+            "target_role_categories": ["backend"],
+        }
+        frontend = {
+            "skills": ["React"],
+            "skill_years": {"React": 2},
+            "roles": ["Frontend Engineer"],
+            "total_years_experience": 2,
+            "target_role_categories": ["frontend"],
+        }
+        job = normalize_job(
+            {
+                "job_id": "123",
+                "title": "Backend Engineer",
+                "location": "Karachi, Pakistan",
+                "workplace_type": "On-site",
+                "required_skills": ["Python", "Django", "REST APIs"],
+                "description": "Build backend APIs",
+            },
+            "Backend Engineer",
+        )
+
+        ranked = prepare_ranked_jobs(
+            [job],
+            {"backend.pdf": backend, "frontend.pdf": frontend},
+            config,
+        )
+
+        self.assertEqual(ranked[0]["selected_resume"], "backend.pdf")
+        self.assertGreater(ranked[0]["fit"]["score"], 0)
+        self.assertEqual(ranked[0]["resume_profile"], backend)
+
+    def test_submitted_tracking_depends_on_apply_result(self):
+        page = Mock()
+        ranked = [
+            {
+                "job": {
+                    "job_id": "123",
+                    "url": "https://www.linkedin.com/jobs/view/123",
+                    "title": "Backend Engineer",
+                    "company": "Example",
+                    "location": "Karachi, Pakistan",
+                    "applicant_count": 10,
+                    "matched_roles": ["Backend Engineer"],
+                },
+                "selected_resume": "backend.pdf",
+                "resume_profile": {"skills": ["Python"]},
+                "fit": {"score": 90, "tier": "A"},
+            }
+        ]
+
+        with (
+            patch("linkedin_search.already_applied", return_value=False),
+            patch("linkedin_search.click_easy_apply", return_value=True),
+            patch("linkedin_search.apply_to_current_job", return_value=False),
+            patch("linkedin_search.save_applied_id") as save,
+            patch("linkedin_search.save_not_targeted"),
+        ):
+            applied, skipped = apply_ranked_jobs(
+                page,
+                ranked,
+                normalize_config({"role": "Backend Engineer", "max_applications": 5}),
+                Mock(),
+                Mock(),
+                set(),
+            )
+
+        self.assertEqual((applied, skipped), (0, 1))
+        save.assert_not_called()
 
 
 if __name__ == "__main__":

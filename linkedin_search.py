@@ -16,10 +16,14 @@ from easy_apply import apply_to_current_job, dismiss_modal
 from gemini_client import Gemini, GeminiError
 from job_intelligence import (
     analyze_job,
+    deduplicate_jobs,
+    enabled_role_profiles,
     normalize_config,
     normalize_job,
+    rank_jobs,
     rank_resumes,
     recency_filter,
+    score_job,
 )
 from qa_store import QAStore
 from resume_profile import (
@@ -91,6 +95,12 @@ JOB_LOCATION_SELECTORS = [
 JOB_DESCRIPTION_SELECTORS = [
     ".jobs-description__content",
     ".jobs-box__html-content",
+]
+
+JOB_INSIGHT_SELECTORS = [
+    ".job-details-jobs-unified-top-card__job-insight",
+    ".jobs-unified-top-card__job-insight",
+    ".job-details-jobs-unified-top-card__primary-description-container",
 ]
 
 
@@ -271,12 +281,31 @@ def applicant_count(page):
 
 
 def job_context(page):
+    location_text = text_of(page, JOB_LOCATION_SELECTORS)
+    parts = [part.strip() for part in location_text.split("·") if part.strip()]
+    insights = []
+    for selector in JOB_INSIGHT_SELECTORS:
+        locators = page.locator(selector)
+        try:
+            insights.extend((locators.nth(i).inner_text() or "").strip() for i in range(min(locators.count(), 10)))
+        except Exception:
+            continue
+    structured = " | ".join(parts + insights)
+    workplace = next((name for name in ("Remote", "Hybrid", "On-site") if name.lower() in structured.lower()), None)
+    employment = next((name for name in ("Full-time", "Part-time", "Contract", "Temporary", "Internship") if name.lower() in structured.lower()), None)
+    seniority = next((name for name in ("Internship", "Entry level", "Associate", "Mid-Senior level", "Director", "Executive") if name.lower() in structured.lower()), None)
+    posting = next((part for part in parts if re.search(r"\b(?:minute|hour|day|week|month)s? ago\b|reposted", part, re.I)), None)
     return {
         "title": text_of(page, JOB_TITLE_SELECTORS),
         "company": text_of(page, JOB_COMPANY_SELECTORS),
-        "location": text_of(page, JOB_LOCATION_SELECTORS),
+        "location": parts[0] if parts else location_text,
+        "employment_type": employment,
+        "workplace_type": workplace,
+        "seniority": seniority,
+        "posting_date": posting,
         "description": text_of(page, JOB_DESCRIPTION_SELECTORS),
         "url": page.url,
+        "application_method": "EASY_APPLY" if find_easy_apply_button(page) else "EXTERNAL",
     }
 
 
@@ -343,8 +372,14 @@ def choose_resume_path(ctx, config, gemini=None, resume_profiles=None):
 
 
 def job_id(ctx):
+    if ctx.get("job_id"):
+        return str(ctx["job_id"])
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(ctx.get("url", "")).query)
-    return (query.get("currentJobId") or [None])[0]
+    identifier = (query.get("currentJobId") or [None])[0]
+    if identifier:
+        return identifier
+    match = re.search(r"/jobs/view/(?:[^/?#]*-)?(\d+)(?:/|$)", ctx.get("url", ""))
+    return match.group(1) if match else None
 
 
 def load_applied_ids():
@@ -460,30 +495,186 @@ def already_applied(page):
     return False
 
 
-def run(config):
-    # LinkedIn's keyword matcher treats the whole template as literal terms, which
-    # buries good results. The "recent" and "Easy Apply" parts are already handled
-    # by the f_TPR/f_AL URL filters, and the applicant cap is enforced below from
-    # the details panel, so search on the role alone by default.
-    if config.get("keywords_mode", "role") == "template":
-        keywords = config["query_template"].format(
-            role=config["role"], applicants=config["applicants"]
-        )
-    else:
-        keywords = config["role"]
+def _collect_current_search(page, role_profile, config):
+    keywords = " OR ".join(role_profile.get("keywords") or [role_profile["name"]])
+    open_jobs_search(page, keywords, config, target_url=role_profile.get("target_url"))
+    total = hydrate_cards(page)
+    print(f"{total} job card(s) for {role_profile['name']}.")
+    jobs = []
+    for index in range(total):
+        cards = job_cards(page)
+        if not cards or index >= cards.count():
+            break
+        card = cards.nth(index)
+        try:
+            card.scroll_into_view_if_needed()
+            page.wait_for_timeout(500)
+            card.click()
+            page.wait_for_timeout(1500)
+            raw = job_context(page)
+            raw["applicant_count"] = applicant_count(page)
+            jobs.append(normalize_job(raw, role_profile["name"]))
+        except Exception as exc:
+            print(f"[{index + 1}] could not collect card: {exc}")
+    return jobs
 
+
+def _page_url(url, page_number):
+    if not page_number:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    query["start"] = str(page_number * 25)
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+
+
+def discover_jobs(page, config):
+    links = load_links()
+    if config.get("target_url"):
+        links = [config["target_url"]]
+    if links:
+        sources = [
+            {
+                "name": "roles from links.txt",
+                "priority": 1,
+                "keywords": [],
+                "minimum_fit_score": config.get("minimum_fit_score", 70),
+                "enabled": True,
+                "target_url": link,
+            }
+            for link in links
+        ]
+    else:
+        sources = enabled_role_profiles(config)
+
+    discovered = []
+    for profile in sources:
+        if links:
+            base_url = profile["target_url"]
+        else:
+            keywords = " OR ".join(profile.get("keywords") or [profile["name"]])
+            base_url = search_url(keywords, config)
+        for page_number in range(int(config.get("max_search_pages", 1))):
+            page_profile = {**profile, "target_url": _page_url(base_url, page_number)}
+            batch = _collect_current_search(page, page_profile, config)
+            discovered.extend(batch)
+            if not batch:
+                break
+    return deduplicate_jobs(discovered)
+
+
+def prepare_ranked_jobs(jobs, resume_profiles, config, gemini=None):
+    profiles_by_name = {profile["name"]: profile for profile in enabled_role_profiles(config)}
+    prepared = []
+    for job in jobs:
+        analyzed = analyze_job(job, gemini)
+        resume_ranking = rank_resumes(analyzed, resume_profiles)
+        selected = choose_resume_path(
+            analyzed,
+            config,
+            gemini=gemini,
+            resume_profiles=resume_profiles,
+        )
+        if not selected or selected not in resume_profiles:
+            print(f"  [warn] no validated resume for {analyzed.get('title') or 'untitled job'}")
+            continue
+        matched_profiles = [
+            profiles_by_name[name]
+            for name in analyzed.get("matched_roles", [])
+            if name in profiles_by_name
+        ] or list(profiles_by_name.values())
+        fit = score_job(analyzed, resume_profiles[selected], matched_profiles, config)
+        prepared.append(
+            {
+                "job": analyzed,
+                "selected_resume": selected,
+                "resume_profile": resume_profiles[selected],
+                "resume_ranking": resume_ranking,
+                "fit": fit,
+                "role_priority": min(
+                    (profile.get("priority", 3) for profile in matched_profiles),
+                    default=3,
+                ),
+            }
+        )
+    return rank_jobs(prepared, config)
+
+
+def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
     max_applicants = int(config.get("applicants") or 0) or None
     max_applications = int(config.get("max_applications", 5))
-    applied_ids = load_applied_ids()
-    resume_path = config.get("resume_path")
-    if not resume_path:
-        print("Set 'resume_path' in config.json to your resume PDF.")
-        sys.exit(1)
+    applied = skipped = 0
+    for index, item in enumerate(ranked_jobs):
+        if applied >= max_applications:
+            break
+        job = item["job"]
+        fit = item["fit"]
+        role_label = ", ".join(job.get("matched_roles") or ["unknown role"])
+        identifier = job.get("job_id")
+        if fit["tier"] not in ("A", "B"):
+            save_not_targeted(job, f"fit score {fit['score']} below threshold", role_label)
+            skipped += 1
+            continue
+        if identifier and identifier in applied_ids:
+            skipped += 1
+            continue
+        if load_not_targeted().get(not_targeted_key(job)):
+            skipped += 1
+            continue
+        count = job.get("applicant_count")
+        if max_applicants and count is not None and count > max_applicants:
+            save_not_targeted(job, f"over {max_applicants}-applicant cap", role_label)
+            skipped += 1
+            continue
+        if job.get("application_method") == "EXTERNAL":
+            save_not_targeted(job, "external application required", role_label)
+            print(f"EXTERNAL APPLICATION REQUIRED: {job.get('url')}")
+            skipped += 1
+            continue
 
+        try:
+            page.goto(job["url"], wait_until="domcontentloaded", timeout=int(config.get("navigation_timeout_ms", 60000)))
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(config.get("page_load_wait_ms", 3000))
+        if already_applied(page):
+            skipped += 1
+            continue
+        if not click_easy_apply(page, timeout=8000):
+            save_not_targeted(job, "no Easy Apply button", role_label)
+            skipped += 1
+            continue
+        try:
+            sent = apply_to_current_job(
+                page,
+                gemini,
+                item["resume_profile"],
+                job,
+                resume_path=item["selected_resume"],
+                store=store,
+            )
+        except GeminiError:
+            raise
+        except Exception as exc:
+            print(f"  [error] {exc}")
+            page.screenshot(path=f"error_apply_{index + 1}.png")
+            sent = False
+        if sent:
+            applied += 1
+            if identifier:
+                save_applied_id(identifier)
+                applied_ids.add(identifier)
+        else:
+            save_not_targeted(job, "application not submitted", role_label)
+            skipped += 1
+            dismiss_modal(page)
+    return applied, skipped
+
+
+def run(config):
     gemini = Gemini(config)
     store = QAStore()
     print(f"Loaded {len(store)} cached question/answer pair(s).")
-
     if not os.path.exists("linkedin_state.json"):
         print("linkedin_state.json not found. Run linkedin_login.py first.")
         sys.exit(1)
@@ -503,7 +694,6 @@ def run(config):
             browser = p.chromium.launch(channel="chrome", **launch_kwargs)
         except Exception:
             browser = p.chromium.launch(**launch_kwargs)
-
         context = browser.new_context(
             storage_state="linkedin_state.json",
             user_agent=USER_AGENT,
@@ -511,112 +701,26 @@ def run(config):
         )
         context.add_init_script(STEALTH_SCRIPT)
         page = context.new_page()
+        resume_profiles = load_resume_profiles(config, gemini)
+        if not resume_profiles:
+            context.close()
+            browser.close()
+            raise RuntimeError("No resume profile could be loaded or built")
 
-        open_jobs_search(page, keywords, config, target_url=config.get("target_url"))
+        jobs = discover_jobs(page, config)
+        ranked = prepare_ranked_jobs(jobs, resume_profiles, config, gemini)
+        print(f"\nRanked {len(ranked)} unique job(s) from {len(jobs)} discovery record(s).")
+        for item in ranked:
+            job, fit = item["job"], item["fit"]
+            print(f"  [{fit['tier']}] {fit['score']}/100 {job['title']} @ {job['company']} -> {Path(item['selected_resume']).name}")
 
-        total = hydrate_cards(page)
-        print(f"{total} job card(s) on this page.")
-        if not total:
-            page.screenshot(path="error_no_cards.png", full_page=True)
-            print("No cards found. Saved error_no_cards.png; run dump_page.py to inspect the DOM.")
-
-        applied = 0
-        skipped = 0
-
-        for i in range(total):
-            if applied >= max_applications:
-                break
-
-            cards = job_cards(page)
-            if not cards or i >= cards.count():
-                break
-
-            card = cards.nth(i)
-            try:
-                card.scroll_into_view_if_needed()
-                page.wait_for_timeout(500)
-                card.click()
-            except Exception as e:
-                print(f"[{i + 1}] could not open card: {e}")
-                continue
-
-            page.wait_for_timeout(2500)
-            ctx = job_context(page)
-            count = applicant_count(page)
-            identifier = job_id(ctx)
-            label = f"{count} applicants" if count is not None else "applicant count unknown"
-            print(f"\n[{i + 1}/{total}] {ctx['title']} @ {ctx['company']} ({label})")
-
-            if identifier and identifier in applied_ids:
-                print(f"  Already applied; tracked currentJobId {identifier}; skipping.")
-                skipped += 1
-                continue
-
-            prior_skip = load_not_targeted().get(not_targeted_key(ctx))
-            if prior_skip:
-                print(f"  Previously skipped ({prior_skip['reason']}); skipping.")
-                skipped += 1
-                continue
-
-            if not allowed_location(ctx):
-                save_not_targeted(ctx, "location not eligible", config["role"])
-                print(f"  Location not eligible: {ctx['location'] or 'unknown'}; skipping.")
-                skipped += 1
-                continue
-
-            resume_path = choose_resume_path(ctx, config, gemini=gemini)
-            if not resume_path or not os.path.exists(resume_path):
-                save_not_targeted(ctx, "no matching resume", config["role"])
-                print("  No matching resume found; skipping.")
-                skipped += 1
-                continue
-            profile = get_or_build_profile(resume_path, gemini=gemini)
-
-            if max_applicants and count is not None and count > max_applicants:
-                save_not_targeted(ctx, f"over {max_applicants}-applicant cap", config["role"])
-                print(f"  Over the {max_applicants}-applicant cap; skipping.")
-                skipped += 1
-                continue
-
-            if already_applied(page):
-                print("  Already applied; skipping.")
-                skipped += 1
-                continue
-
-            if not click_easy_apply(page, timeout=8000):
-                save_not_targeted(ctx, "no Easy Apply button", config["role"])
-                print("  No Easy Apply button; skipping.")
-                skipped += 1
-                continue
-
-            try:
-                sent = apply_to_current_job(page, gemini, profile, ctx, resume_path=resume_path, store=store)
-            except GeminiError:
-                raise
-            except Exception as e:
-                print(f"  [error] {e}")
-                page.screenshot(path=f"error_apply_{i + 1}.png")
-                sent = False
-
-            if sent:
-                applied += 1
-                if identifier:
-                    save_applied_id(identifier)
-                    applied_ids.add(identifier)
-                    print(f"  Tracked currentJobId: {identifier}")
-                print(f"  Applied ({applied}/{max_applications}).")
-            else:
-                save_not_targeted(ctx, "application not submitted", config["role"])
-                skipped += 1
-                print("  Not submitted; moving on.")
-                dismiss_modal(page)
-
-            page.wait_for_timeout(2000)
-
+        applied, skipped = apply_ranked_jobs(
+            page, ranked, config, gemini, store, load_applied_ids()
+        )
         print(f"\nDone. Applied to {applied} job(s), skipped {skipped}.")
         context.close()
         browser.close()
-        return total
+        return len(jobs)
 
 
 def main():
@@ -629,43 +733,21 @@ def main():
     config = load_config()
     if args.role:
         config["role"] = args.role
+        config["target_roles"] = [
+            {
+                "name": args.role,
+                "priority": 1,
+                "keywords": [args.role],
+                "minimum_fit_score": config.get("minimum_fit_score", 70),
+                "enabled": True,
+            }
+        ]
     if args.applicants:
         config["applicants"] = args.applicants
     if args.max:
         config["max_applications"] = args.max
 
-    # A positional role is an explicit one-role override. Otherwise, process
-    # each configured target independently so one search cannot hide the next.
-    roles = [config.get("role", "Software Engineer")]
-    if not args.role:
-        configured_roles = config.get("roles")
-        if isinstance(configured_roles, list):
-            roles = [str(role).strip() for role in configured_roles if str(role).strip()]
-
-    links = load_links()
-    if links:
-        # links.txt is authoritative: its search URL already contains the
-        # user's combined role and location targeting.
-        for link in links:
-            for page_number in range(int(config.get("max_search_pages", 10))):
-                link_config = dict(config)
-                parsed_link = urllib.parse.urlsplit(link)
-                query = dict(urllib.parse.parse_qsl(parsed_link.query, keep_blank_values=True))
-                query["start"] = str(page_number * 25)
-                link_config["target_url"] = urllib.parse.urlunsplit(
-                    parsed_link._replace(query=urllib.parse.urlencode(query))
-                )
-                link_config["role"] = "roles from links.txt"
-                print(f"\n=== Target search link, page {page_number + 1}: {link_config['target_url']} ===")
-                total = run(link_config)
-                if not total:
-                    break
-    else:
-        for role in roles:
-            role_config = dict(config)
-            role_config["role"] = role
-            print(f"\n=== Target role: {role} ===")
-            run(role_config)
+    run(normalize_config(config))
 
 
 if __name__ == "__main__":
