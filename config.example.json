@@ -23,6 +23,7 @@
   },
   "preferred_companies": [],
   "excluded_companies": [],
+  "max_search_pages": 10,
   "max_applications": 5,
   "page_load_wait_ms": 3000,
   "resume_path": "C:\\Users\\YourName\\Documents\\resume.pdf",

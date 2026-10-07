@@ -554,7 +554,7 @@ def discover_jobs(page, config):
         else:
             keywords = " OR ".join(profile.get("keywords") or [profile["name"]])
             base_url = search_url(keywords, config)
-        for page_number in range(int(config.get("max_search_pages", 1))):
+        for page_number in range(int(config.get("max_search_pages", 10))):
             page_profile = {**profile, "target_url": _page_url(base_url, page_number)}
             batch = _collect_current_search(page, page_profile, config)
             discovered.extend(batch)

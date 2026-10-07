@@ -90,7 +90,7 @@ class ResumeProfileCacheTests(unittest.TestCase):
             resume.write_text("Python", encoding="utf-8")
             profile = factual_profile()
             profile["_resume_path"] = str(resume.resolve())
-            profile["_resume_text"] = "Python"
+            profile["_resume_sha256"] = resume_digest(resume)
             legacy.write_text(json.dumps(profile), encoding="utf-8")
             fake = Mock()
 
@@ -100,6 +100,25 @@ class ResumeProfileCacheTests(unittest.TestCase):
             self.assertEqual(loaded["_resume_sha256"], resume_digest(resume))
             fake.generate_json_object.assert_not_called()
             self.assertTrue(profile_cache_path(resume, cache).exists())
+
+    def test_stale_legacy_profile_is_not_imported(self):
+        with tempfile.TemporaryDirectory() as root:
+            resume = Path(root) / "backend.txt"
+            cache = Path(root) / "cache"
+            legacy = Path(root) / "resume_profile.json"
+            resume.write_text("Python and Django", encoding="utf-8")
+            profile = factual_profile()
+            profile["_resume_path"] = str(resume.resolve())
+            profile["_resume_sha256"] = "stale"
+            legacy.write_text(json.dumps(profile), encoding="utf-8")
+            fake = Mock()
+            fake.generate_json_object.return_value = factual_profile()
+
+            with patch("resume_profile.PROFILE_PATH", str(legacy)):
+                loaded = get_or_build_profile(resume, gemini=fake, cache_dir=cache)
+
+            self.assertEqual(loaded["_resume_sha256"], resume_digest(resume))
+            fake.generate_json_object.assert_called_once()
 
     def test_invalid_profile_shape_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "skills"):

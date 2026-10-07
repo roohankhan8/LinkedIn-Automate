@@ -509,6 +509,18 @@ class SearchOrchestrationTests(unittest.TestCase):
         self.assertEqual(profile["name"], "roles from links.txt")
         self.assertEqual(profile["target_url"], "https://linkedin.test/search")
 
+    def test_legacy_config_keeps_ten_search_page_default(self):
+        config = normalize_config({"role": "Backend"})
+        observation = [normalize_job({"job_id": "123"}, "Backend")]
+
+        with (
+            patch("linkedin_search.load_links", return_value=[]),
+            patch("linkedin_search._collect_current_search", return_value=observation) as collect,
+        ):
+            discover_jobs(Mock(), config)
+
+        self.assertEqual(collect.call_count, 10)
+
     def test_ranked_pipeline_uses_selected_resume_profile(self):
         config = normalize_config({"role": "Backend Engineer"})
         backend = {

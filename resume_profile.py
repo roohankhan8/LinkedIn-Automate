@@ -213,7 +213,11 @@ def get_or_build_profile(resume_path, force=False, gemini=None, cache_dir=PROFIL
     if not force:
         legacy = load_profile(PROFILE_PATH)
         cached_path = legacy.get("_resume_path") if isinstance(legacy, dict) else None
-        if cached_path and os.path.normcase(os.path.abspath(resume_path)) == os.path.normcase(cached_path):
+        if (
+            cached_path
+            and legacy.get("_resume_sha256") == digest
+            and os.path.normcase(os.path.abspath(resume_path)) == os.path.normcase(cached_path)
+        ):
             profile = _decorate_cached_profile(legacy, resume_path, digest)
             _atomic_save_profile(profile, cache_path)
             print(f"Imported legacy resume profile into {cache_path}")
