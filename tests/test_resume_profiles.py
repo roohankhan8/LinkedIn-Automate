@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from job_intelligence import canonical_skill, rank_resumes
+from linkedin_search import choose_resume_path
 from resume_profile import (
     get_or_build_profile,
     profile_cache_path,
@@ -114,6 +116,89 @@ class ResumeProfileCacheTests(unittest.TestCase):
             get_or_build_profile(resume, gemini=fake, cache_dir=cache)
 
             self.assertEqual(list(cache.glob("*.tmp")), [])
+
+
+class ResumeRankingTests(unittest.TestCase):
+    def test_backend_profile_beats_frontend_profile_for_python_api_job(self):
+        job = {
+            "title": "Python Backend Engineer",
+            "description": "Build REST APIs for backend services",
+            "required_skills": ["Python", "Django", "REST APIs"],
+            "preferred_skills": ["Docker"],
+            "responsibilities": ["Build backend APIs"],
+            "matched_roles": ["Backend Engineer"],
+        }
+        backend = factual_profile()
+        backend["skills"] += ["REST API", "Docker"]
+        frontend = factual_profile("Frontend Engineer")
+        frontend.update(
+            {
+                "skills": ["React", "JavaScript"],
+                "skill_years": {"React": 2},
+                "roles": ["Frontend Engineer"],
+                "domains": ["UI"],
+                "projects": [],
+                "keywords": ["frontend"],
+                "target_role_categories": ["frontend"],
+            }
+        )
+
+        ranked = rank_resumes(job, {"backend.pdf": backend, "frontend.pdf": frontend})
+
+        self.assertEqual(ranked[0]["path"], "backend.pdf")
+        self.assertGreater(ranked[0]["score"], ranked[1]["score"])
+        self.assertIn("Python", ranked[0]["strong_matches"])
+        self.assertEqual(ranked[0]["missing_required"], [])
+
+    def test_skill_aliases_are_canonical(self):
+        self.assertEqual(canonical_skill("REST API"), "rest api")
+        self.assertEqual(canonical_skill("REST APIs"), "rest api")
+        self.assertEqual(canonical_skill("Postgres"), "postgresql")
+
+    def test_ranking_reports_partial_and_missing_skills(self):
+        job = {
+            "title": "AI Backend Engineer",
+            "description": "AI integration services",
+            "required_skills": ["AI integration", "Python"],
+            "preferred_skills": ["Kubernetes"],
+            "responsibilities": [],
+            "matched_roles": ["AI Backend Engineer"],
+        }
+        profile = factual_profile()
+        profile["skills"].append("LangChain")
+
+        result = rank_resumes(job, {"backend.pdf": profile})[0]
+
+        self.assertIn("Python", result["strong_matches"])
+        self.assertIn("AI integration", result["partial_matches"])
+        self.assertEqual(result["missing_preferred"], ["Kubernetes"])
+        self.assertIn("Kubernetes", result["reasoning"])
+
+    def test_equal_scores_use_stable_path_order(self):
+        job = {
+            "title": "Backend Engineer",
+            "required_skills": ["Python"],
+            "preferred_skills": [],
+            "responsibilities": [],
+            "matched_roles": ["Backend Engineer"],
+        }
+        profile = factual_profile()
+
+        ranked = rank_resumes(job, {"z.pdf": profile, "a.pdf": profile})
+
+        self.assertEqual([item["path"] for item in ranked], ["a.pdf", "z.pdf"])
+
+    def test_choose_resume_path_keeps_existing_two_argument_call(self):
+        with tempfile.TemporaryDirectory() as root:
+            fallback = Path(root) / "resume.pdf"
+            fallback.write_bytes(b"resume")
+            with patch("linkedin_search.load_resume_profiles", return_value={}):
+                selected = choose_resume_path(
+                    {"title": "Unknown role", "description": ""},
+                    {"resume_path": str(fallback)},
+                )
+
+        self.assertEqual(selected, str(fallback))
 
 
 if __name__ == "__main__":

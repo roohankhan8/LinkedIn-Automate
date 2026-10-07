@@ -14,9 +14,19 @@ from playwright.sync_api import sync_playwright
 
 from easy_apply import apply_to_current_job, dismiss_modal
 from gemini_client import Gemini, GeminiError
-from job_intelligence import normalize_config, recency_filter
+from job_intelligence import (
+    analyze_job,
+    normalize_config,
+    normalize_job,
+    rank_resumes,
+    recency_filter,
+)
 from qa_store import QAStore
-from resume_profile import get_or_build_profile
+from resume_profile import (
+    get_or_build_profile,
+    profile_cache_path,
+    validate_resume_profile,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -31,6 +41,7 @@ LINKS_PATH = Path(__file__).resolve().parent / "links.txt"
 NOT_TARGETED_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.txt"
 NOT_TARGETED_JSON_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.json"
 APPLIED_JOBS_PATH = Path(__file__).resolve().parent / "applied_jobs.json"
+RESUMES_DIR = Path(__file__).resolve().parent / "resumes"
 
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -269,9 +280,40 @@ def job_context(page):
     }
 
 
-def choose_resume_path(ctx, config):
-    root = Path(__file__).resolve().parent / "resumes"
-    resumes = list(root.glob("*.pdf")) + list(root.glob("*.docx")) + list(root.glob("*.doc"))
+def load_resume_profiles(config, gemini=None):
+    resumes = list(RESUMES_DIR.glob("*.pdf")) + list(RESUMES_DIR.glob("*.docx")) + list(RESUMES_DIR.glob("*.doc"))
+    profiles = {}
+    for path in resumes:
+        try:
+            if gemini is not None:
+                profile = get_or_build_profile(path, gemini=gemini)
+            else:
+                cached = profile_cache_path(path)
+                if not cached.exists():
+                    continue
+                profile = validate_resume_profile(json.loads(cached.read_text(encoding="utf-8")))
+            profiles[str(path)] = profile
+        except Exception as exc:
+            print(f"  [warn] resume profile unavailable for {path.name}: {exc}")
+    return profiles
+
+
+def choose_resume_path(ctx, config, gemini=None, resume_profiles=None):
+    profiles = resume_profiles if resume_profiles is not None else load_resume_profiles(config, gemini)
+    if profiles:
+        job = analyze_job(normalize_job(ctx, ""))
+        ranked = rank_resumes(job, profiles)
+        if ranked:
+            best = ranked[0]
+            print(f"  Recommended resume: {Path(best['path']).name} ({best['score']}/100)")
+            print(f"  Resume match: {best['reasoning']}")
+            return best["path"]
+
+    configured = config.get("default_resume_path") or config.get("resume_path")
+    if configured and os.path.exists(configured):
+        return configured
+
+    resumes = list(RESUMES_DIR.glob("*.pdf")) + list(RESUMES_DIR.glob("*.docx")) + list(RESUMES_DIR.glob("*.doc"))
     text = " ".join((ctx.get(k) or "") for k in ("title", "company", "description")).lower()
     groups = {
         "backend": ("backend", "back-end", "django", "fastapi", "api", "server"),
@@ -295,11 +337,8 @@ def choose_resume_path(ctx, config):
 
     ranked = sorted(resumes, key=lambda path: (-score(path), path.name.lower()))
     if ranked and score(ranked[0]) > 0:
+        print("  [warn] using filename-only resume matching because no profile is available")
         return str(ranked[0])
-
-    configured = config.get("default_resume_path") or config.get("resume_path")
-    if configured and os.path.exists(configured):
-        return configured
     return None
 
 
@@ -525,7 +564,7 @@ def run(config):
                 skipped += 1
                 continue
 
-            resume_path = choose_resume_path(ctx, config)
+            resume_path = choose_resume_path(ctx, config, gemini=gemini)
             if not resume_path or not os.path.exists(resume_path):
                 save_not_targeted(ctx, "no matching resume", config["role"])
                 print("  No matching resume found; skipping.")

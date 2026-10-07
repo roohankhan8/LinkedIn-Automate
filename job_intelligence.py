@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+import json
 from datetime import date, timedelta
 
 from gemini_client import GeminiError
@@ -421,3 +422,130 @@ def analyze_job(job: dict, gemini=None) -> dict:
         if not result.get(key) and semantic.get(key) is not None:
             result[key] = semantic[key]
     return result
+
+
+def canonical_skill(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9+#]+", " ", str(value or "").lower()).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    for canonical, aliases in SKILL_ALIASES.items():
+        candidates = (canonical, *aliases)
+        if normalized in {
+            re.sub(r"\s+", " ", re.sub(r"[^a-z0-9+#]+", " ", item.lower())).strip()
+            for item in candidates
+        }:
+            return {
+                "REST APIs": "rest api",
+                "PostgreSQL": "postgresql",
+                "Node.js": "node.js",
+            }.get(canonical, canonical.lower())
+    return normalized
+
+
+RELATED_SKILL_GROUPS = [
+    {"ai integration", "langchain", "langgraph", "rag"},
+    {"django", "fastapi", "laravel", "backend"},
+    {"postgresql", "mysql", "mongodb", "sql", "database"},
+    {"aws", "azure", "gcp", "cloud"},
+    {"react", "javascript", "typescript", "frontend"},
+]
+
+
+def _related_skill(required: str, available: set[str]) -> bool:
+    return any(required in group and available.intersection(group) for group in RELATED_SKILL_GROUPS)
+
+
+def _role_tokens(values) -> set[str]:
+    ignored = {"engineer", "developer", "software", "full", "stack", "application"}
+    text = " ".join(str(value) for value in values if value)
+    return {
+        token
+        for token in re.findall(r"[a-z0-9+#]+", text.lower())
+        if len(token) > 2 and token not in ignored
+    }
+
+
+def rank_resumes(job: dict, resume_profiles: dict[str, dict]) -> list[dict]:
+    """Rank validated resume profiles against one analyzed job."""
+    results = []
+    required = job.get("required_skills") or []
+    preferred = job.get("preferred_skills") or []
+    job_role_tokens = _role_tokens([job.get("title"), *(job.get("matched_roles") or [])])
+    job_text = " ".join(
+        [
+            job.get("title") or "",
+            job.get("description") or "",
+            *(job.get("responsibilities") or []),
+        ]
+    ).lower()
+
+    for path, profile in resume_profiles.items():
+        skills = list(profile.get("skills") or []) + list((profile.get("skill_years") or {}).keys())
+        available = {canonical_skill(skill) for skill in skills}
+        strong, partial, missing_required, missing_preferred = [], [], [], []
+
+        required_credit = 0.0
+        for skill in required:
+            canonical = canonical_skill(skill)
+            if canonical in available:
+                strong.append(skill)
+                required_credit += 1
+            elif _related_skill(canonical, available):
+                partial.append(skill)
+                required_credit += 0.5
+            else:
+                missing_required.append(skill)
+
+        preferred_credit = 0.0
+        for skill in preferred:
+            canonical = canonical_skill(skill)
+            if canonical in available:
+                strong.append(skill)
+                preferred_credit += 1
+            elif _related_skill(canonical, available):
+                partial.append(skill)
+                preferred_credit += 0.5
+            else:
+                missing_preferred.append(skill)
+
+        required_points = 60 * required_credit / len(required) if required else 0
+        preferred_points = 15 * preferred_credit / len(preferred) if preferred else 0
+        profile_role_tokens = _role_tokens(
+            [
+                profile.get("headline"),
+                *(profile.get("roles") or []),
+                *(profile.get("target_role_categories") or []),
+            ]
+        )
+        role_points = 15 if job_role_tokens.intersection(profile_role_tokens) else 0
+        evidence = " ".join(
+            [
+                *(str(item) for item in (profile.get("domains") or [])),
+                *(str(item) for item in (profile.get("keywords") or [])),
+                json.dumps(profile.get("projects") or [], ensure_ascii=False),
+            ]
+        ).lower()
+        evidence_terms = {
+            token for token in re.findall(r"[a-z0-9+#]+", evidence) if len(token) > 3
+        }
+        domain_points = 10 if any(term in job_text for term in evidence_terms) else 0
+        score = round(required_points + preferred_points + role_points + domain_points)
+        reasons = []
+        if strong:
+            reasons.append(f"strong: {', '.join(strong)}")
+        if partial:
+            reasons.append(f"partial: {', '.join(partial)}")
+        missing = missing_required + missing_preferred
+        if missing:
+            reasons.append(f"missing: {', '.join(missing)}")
+        results.append(
+            {
+                "path": str(path),
+                "score": score,
+                "strong_matches": list(dict.fromkeys(strong)),
+                "partial_matches": list(dict.fromkeys(partial)),
+                "missing_required": missing_required,
+                "missing_preferred": missing_preferred,
+                "reasoning": "; ".join(reasons) or "No documented skill match.",
+            }
+        )
+    return sorted(results, key=lambda item: (-item["score"], item["path"].lower()))
