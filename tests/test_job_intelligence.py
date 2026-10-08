@@ -21,6 +21,7 @@ from job_intelligence import (
     score_job,
 )
 from linkedin_search import (
+    _classic_search_url,
     apply_ranked_jobs,
     discover_jobs,
     job_id,
@@ -475,6 +476,17 @@ class JobFitScoringTests(unittest.TestCase):
 
 
 class SearchOrchestrationTests(unittest.TestCase):
+    def test_saved_sdui_link_becomes_unpinned_classic_search(self):
+        url = _classic_search_url(
+            "https://www.linkedin.com/jobs/search-results/?currentJobId=123&keywords=Backend&"
+            "origin=PREFERENCES_LANDING&referralSearchId=abc&f_AL=true"
+        )
+
+        self.assertEqual(
+            url,
+            "https://www.linkedin.com/jobs/search/?keywords=Backend&f_AL=true",
+        )
+
     def test_job_id_accepts_normalized_job_and_canonical_url(self):
         self.assertEqual(
             job_id({"job_id": "123", "url": "https://www.linkedin.com/jobs/view/123"}),

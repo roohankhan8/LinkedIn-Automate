@@ -190,8 +190,21 @@ def search_url(keywords, config):
     return "https://www.linkedin.com/jobs/search/?" + urllib.parse.urlencode(params)
 
 
+def _classic_search_url(url):
+    """Make a saved LinkedIn results link safe for deterministic pagination."""
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path.replace("/jobs/search-results/", "/jobs/search/")
+    ignored = {"currentJobId", "origin", "referralSearchId", "trk"}
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key not in ignored
+    ]
+    return urllib.parse.urlunsplit(parsed._replace(path=path, query=urllib.parse.urlencode(query)))
+
+
 def open_jobs_search(page, keywords, config, target_url=None):
-    url = target_url or search_url(keywords, config)
+    url = _classic_search_url(target_url) if target_url else search_url(keywords, config)
     print(f"Opening: {url}")
     try:
         # LinkedIn often keeps network requests open indefinitely. Waiting for
