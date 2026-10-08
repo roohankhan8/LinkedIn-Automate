@@ -146,6 +146,7 @@ PROFILE_LIST_FIELDS = {
     "keywords",
     "target_role_categories",
 }
+PROFILE_STRING_LIST_FIELDS = PROFILE_LIST_FIELDS - {"experience", "projects", "education"}
 
 
 def validate_resume_profile(value):
@@ -156,6 +157,9 @@ def validate_resume_profile(value):
         item = profile.get(key, [])
         if not isinstance(item, list):
             raise ValueError(f"resume profile field {key} must be a list")
+        expected = str if key in PROFILE_STRING_LIST_FIELDS else dict
+        if not all(isinstance(entry, expected) for entry in item):
+            raise ValueError(f"resume profile field {key} has invalid entries")
         profile[key] = item
     skill_years = profile.get("skill_years", {})
     if not isinstance(skill_years, dict):

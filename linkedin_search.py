@@ -311,6 +311,11 @@ def job_context(page):
 
 def load_resume_profiles(config, gemini=None):
     resumes = list(RESUMES_DIR.glob("*.pdf")) + list(RESUMES_DIR.glob("*.docx")) + list(RESUMES_DIR.glob("*.doc"))
+    for key in ("default_resume_path", "resume_path"):
+        configured = config.get(key)
+        if configured and Path(configured).is_file():
+            resumes.append(Path(configured))
+    resumes = list(dict.fromkeys(resumes))
     profiles = {}
     for path in resumes:
         try:
@@ -637,6 +642,24 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         except PlaywrightTimeoutError:
             pass
         page.wait_for_timeout(config.get("page_load_wait_ms", 3000))
+        live = job_context(page)
+        live_count = applicant_count(page)
+        live_id = job_id(live)
+        if identifier and live_id and live_id != identifier:
+            save_not_targeted(job, "job identity changed after navigation", role_label)
+            skipped += 1
+            continue
+        job = {
+            **job,
+            **{key: value for key, value in live.items() if value not in (None, "")},
+        }
+        if live_count is not None:
+            job["applicant_count"] = live_count
+        count = job.get("applicant_count")
+        if max_applicants and count is not None and count > max_applicants:
+            save_not_targeted(job, f"over {max_applicants}-applicant cap", role_label)
+            skipped += 1
+            continue
         if already_applied(page):
             skipped += 1
             continue

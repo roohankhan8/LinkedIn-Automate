@@ -1,5 +1,7 @@
+import tempfile
 import unittest
 from datetime import date
+from pathlib import Path
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -18,7 +20,13 @@ from job_intelligence import (
     rank_jobs,
     score_job,
 )
-from linkedin_search import apply_ranked_jobs, discover_jobs, job_id, prepare_ranked_jobs
+from linkedin_search import (
+    apply_ranked_jobs,
+    discover_jobs,
+    job_id,
+    load_resume_profiles,
+    prepare_ranked_jobs,
+)
 
 
 class JobIntelligenceConfigTests(unittest.TestCase):
@@ -294,7 +302,7 @@ class JobAnalysisTests(unittest.TestCase):
             "seniority": "Mid level",
         }
         job = normalize_job(
-            {"job_id": "123", "title": "API Engineer", "description": "Build services."},
+            {"job_id": "123", "title": "API Engineer", "description": "Build services.", "workplace_type": "Remote"},
             "Backend",
         )
 
@@ -304,6 +312,21 @@ class JobAnalysisTests(unittest.TestCase):
         self.assertEqual(result["required_skills"], ["FastAPI"])
         self.assertEqual(result["workplace_type"], "Remote")
         self.assertEqual(result["analysis_concerns"], [])
+
+    def test_ai_cannot_infer_remote_workplace_from_description(self):
+        gemini = Mock()
+        gemini.generate_json_object.return_value = {
+            "required_skills": ["Python"], "preferred_skills": [],
+            "years_experience": None, "education_requirement": None,
+            "responsibilities": [], "employment_type": None,
+            "workplace_type": "Remote", "seniority": None,
+        }
+        job = normalize_job(
+            {"location": "Lahore, Pakistan", "description": "Collaborate with remote teams."},
+            "Backend",
+        )
+
+        self.assertIsNone(analyze_job(job, gemini)["workplace_type"])
 
 
 class JobFitScoringTests(unittest.TestCase):
@@ -382,6 +405,16 @@ class JobFitScoringTests(unittest.TestCase):
 
         self.assertEqual(result["components"]["required_skills"]["earned"], 0)
         self.assertIn("requirements unavailable", result["concerns"])
+
+    def test_matched_role_does_not_make_an_unrelated_title_match(self):
+        result = score_job(
+            {"title": "Accountant", "matched_roles": ["Backend Engineer"],
+             "required_skills": [], "preferred_skills": [],
+             "description": "", "responsibilities": []},
+            self.profile, self.roles, self.config,
+        )
+
+        self.assertEqual(result["components"]["role_title"]["earned"], 0)
 
     def test_thresholds_produce_b_and_c_tiers(self):
         job = {
@@ -559,6 +592,17 @@ class SearchOrchestrationTests(unittest.TestCase):
         self.assertGreater(ranked[0]["fit"]["score"], 0)
         self.assertEqual(ranked[0]["resume_profile"], backend)
 
+    def test_configured_resume_outside_resumes_directory_is_loaded(self):
+        with tempfile.TemporaryDirectory() as root:
+            resume = Path(root) / "resume.txt"
+            resume.write_text("resume", encoding="utf-8")
+            profile = {"skills": ["Python"], "skill_years": {}}
+            with patch("linkedin_search.get_or_build_profile", return_value=profile) as build:
+                profiles = load_resume_profiles({"resume_path": str(resume)}, gemini=Mock())
+
+        self.assertEqual(profiles[str(resume)], profile)
+        self.assertIn(unittest.mock.call(resume, gemini=unittest.mock.ANY), build.call_args_list)
+
     def test_submitted_tracking_depends_on_apply_result(self):
         page = Mock()
         ranked = [
@@ -579,6 +623,8 @@ class SearchOrchestrationTests(unittest.TestCase):
         ]
 
         with (
+            patch("linkedin_search.job_context", return_value={}),
+            patch("linkedin_search.applicant_count", return_value=None),
             patch("linkedin_search.already_applied", return_value=False),
             patch("linkedin_search.click_easy_apply", return_value=True),
             patch("linkedin_search.apply_to_current_job", return_value=False),
@@ -596,6 +642,34 @@ class SearchOrchestrationTests(unittest.TestCase):
 
         self.assertEqual((applied, skipped), (0, 1))
         save.assert_not_called()
+
+    def test_live_applicant_count_is_checked_before_applying(self):
+        page = Mock()
+        ranked = [{
+            "job": {"job_id": "123", "url": "https://www.linkedin.com/jobs/view/123",
+                    "title": "Backend Engineer", "company": "Example", "location": "Karachi",
+                    "applicant_count": 10, "matched_roles": ["Backend Engineer"]},
+            "selected_resume": "backend.pdf", "resume_profile": {"skills": ["Python"]},
+            "fit": {"score": 90, "tier": "A"},
+        }]
+        with (
+            patch("linkedin_search.job_context", return_value={"title": "Backend Engineer"}),
+            patch("linkedin_search.applicant_count", return_value=101),
+            patch("linkedin_search.already_applied", return_value=False),
+            patch("linkedin_search.click_easy_apply") as click,
+            patch("linkedin_search.apply_to_current_job", return_value=True),
+            patch("linkedin_search.save_applied_id"),
+            patch("linkedin_search.save_not_targeted") as save,
+        ):
+            applied, skipped = apply_ranked_jobs(
+                page, ranked,
+                normalize_config({"role": "Backend Engineer", "applicants": 100}),
+                Mock(), Mock(), set(),
+            )
+
+        self.assertEqual((applied, skipped), (0, 1))
+        click.assert_not_called()
+        self.assertIn("applicant cap", save.call_args.args[1])
 
 
 if __name__ == "__main__":

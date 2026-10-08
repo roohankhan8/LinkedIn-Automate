@@ -418,7 +418,7 @@ def analyze_job(job: dict, gemini=None) -> dict:
 
     for key in ("required_skills", "preferred_skills", "responsibilities"):
         result[key] = list(dict.fromkeys((result.get(key) or []) + semantic[key]))
-    for key in ("years_experience", "education_requirement", "employment_type", "workplace_type", "seniority"):
+    for key in ("years_experience", "education_requirement", "employment_type", "seniority"):
         if not result.get(key) and semantic.get(key) is not None:
             result[key] = semantic[key]
     return result
@@ -609,11 +609,12 @@ def score_job(job: dict, resume_profile: dict, role_profiles: list[dict], config
         else:
             missing_preferred.append(skill)
 
-    role_texts = [job.get("title"), *(job.get("matched_roles") or [])]
     configured_role_texts = []
     for profile in role_profiles:
         configured_role_texts.extend([profile.get("name"), *(profile.get("keywords") or [])])
-    role_overlap = _role_tokens(role_texts).intersection(_role_tokens(configured_role_texts))
+    role_overlap = _role_tokens([job.get("title")]).intersection(
+        _role_tokens(configured_role_texts)
+    )
 
     job_text = " ".join(
         [

@@ -124,6 +124,10 @@ class ResumeProfileCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "skills"):
             validate_resume_profile({"skills": "Python"})
 
+    def test_invalid_profile_list_contents_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "roles"):
+            validate_resume_profile({"roles": [{}]})
+
     def test_cache_write_leaves_no_temporary_file(self):
         with tempfile.TemporaryDirectory() as root:
             resume = Path(root) / "backend.txt"
