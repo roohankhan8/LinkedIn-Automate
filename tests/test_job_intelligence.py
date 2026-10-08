@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import date
@@ -21,12 +22,16 @@ from job_intelligence import (
     score_job,
 )
 from linkedin_search import (
+    APPLIED_JOBS_PATH,
+    NOT_TARGETED_JSON_PATH,
     _classic_search_url,
     apply_ranked_jobs,
     discover_jobs,
     job_id,
     load_resume_profiles,
     prepare_ranked_jobs,
+    save_applied_id,
+    save_not_targeted,
 )
 
 
@@ -476,6 +481,37 @@ class JobFitScoringTests(unittest.TestCase):
 
 
 class SearchOrchestrationTests(unittest.TestCase):
+    def test_applied_job_is_saved_as_a_structured_record(self):
+        job = {
+            "job_id": "123", "title": "Backend Engineer", "company": "Example",
+            "location": "Karachi", "url": "https://www.linkedin.com/jobs/view/123",
+        }
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "applied_jobs.json"
+            path.write_text(json.dumps(["old-id"]), encoding="utf-8")
+            with patch("linkedin_search.APPLIED_JOBS_PATH", path):
+                save_applied_id("123", job, "Backend Engineer")
+            records = json.loads(path.read_text(encoding="utf-8"))
+
+        by_id = {record["job_id"]: record for record in records}
+        self.assertEqual(by_id["old-id"], {"job_id": "old-id", "status": "applied"})
+        self.assertEqual(by_id["123"]["title"], "Backend Engineer")
+        self.assertEqual(by_id["123"]["target_role"], "Backend Engineer")
+
+    def test_not_targeted_record_has_explicit_status(self):
+        job = {"job_id": "123", "title": "Backend Engineer", "company": "Example", "location": "Karachi"}
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "not_targeted_jobs.json"
+            text_path = Path(root) / "not_targeted_jobs.txt"
+            with (
+                patch("linkedin_search.NOT_TARGETED_JSON_PATH", path),
+                patch("linkedin_search.NOT_TARGETED_PATH", text_path),
+            ):
+                save_not_targeted(job, "no Easy Apply button", "Backend Engineer")
+            records = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(records[0]["status"], "not_targeted")
+
     def test_saved_sdui_link_becomes_unpinned_classic_search(self):
         url = _classic_search_url(
             "https://www.linkedin.com/jobs/search-results/?currentJobId=123&keywords=Backend&"

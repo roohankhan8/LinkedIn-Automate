@@ -405,16 +405,45 @@ def load_applied_ids():
         return set()
     try:
         data = json.loads(APPLIED_JOBS_PATH.read_text(encoding="utf-8"))
-        return set(str(value) for value in data if value)
+        return {
+            str(value.get("job_id")) if isinstance(value, dict) else str(value)
+            for value in data
+            if (value.get("job_id") if isinstance(value, dict) else value)
+        }
     except (OSError, json.JSONDecodeError):
         return set()
 
 
-def save_applied_id(identifier):
-    applied = load_applied_ids()
-    applied.add(str(identifier))
+def save_applied_id(identifier, ctx=None, role=None):
+    records = {}
+    if APPLIED_JOBS_PATH.exists():
+        try:
+            data = json.loads(APPLIED_JOBS_PATH.read_text(encoding="utf-8"))
+            for value in data if isinstance(data, list) else []:
+                item_id = value.get("job_id") if isinstance(value, dict) else value
+                if item_id:
+                    records[str(item_id)] = (
+                        {**value, "job_id": str(item_id), "status": "applied"}
+                        if isinstance(value, dict)
+                        else {"job_id": str(item_id), "status": "applied"}
+                    )
+        except (OSError, json.JSONDecodeError):
+            pass
+    record = {"job_id": str(identifier), "status": "applied"}
+    if ctx:
+        record.update(
+            {
+                "title": (ctx.get("title") or "").strip(),
+                "company": (ctx.get("company") or "").strip(),
+                "location": (ctx.get("location") or "").strip(),
+                "url": ctx.get("url") or "",
+                "target_role": role or "",
+            }
+        )
+    records[str(identifier)] = record
     APPLIED_JOBS_PATH.write_text(
-        json.dumps(sorted(applied), indent=2), encoding="utf-8"
+        json.dumps(sorted(records.values(), key=lambda item: item["job_id"]), indent=2),
+        encoding="utf-8",
     )
 
 
@@ -454,6 +483,7 @@ def save_not_targeted(ctx, reason, role):
     records = load_not_targeted()
     records[key] = {
         "key": key,
+        "status": "not_targeted",
         "job_id": job_id(ctx),
         "title": title,
         "company": company,
@@ -698,7 +728,7 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         if sent:
             applied += 1
             if identifier:
-                save_applied_id(identifier)
+                save_applied_id(identifier, job, role_label)
                 applied_ids.add(identifier)
         else:
             save_not_targeted(job, "application not submitted", role_label)
