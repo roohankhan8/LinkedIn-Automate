@@ -556,14 +556,12 @@ def location_points(job: dict, config: dict) -> tuple[int, list[str]]:
     workplace = (job.get("workplace_type") or "").lower()
     if not location and not workplace:
         return 0, ["location/workplace unavailable"]
+    if config.get("remote", True) and "remote" in workplace:
+        return 10, []
     if "karachi" in location or "karāchi" in location:
         return 10, []
-    if "pakistan" in location and "remote" in workplace:
-        return 9, []
     if "pakistan" in location:
         return 7, []
-    if config.get("remote", True) and "remote" in workplace:
-        return 5, []
     return 0, ["location is not compatible"]
 
 

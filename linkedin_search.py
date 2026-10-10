@@ -463,8 +463,22 @@ def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
                 applicant_count INTEGER,
                 application_method TEXT,
                 job_json TEXT NOT NULL,
-                scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'discovered',
+                status_reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )"""
+        )
+        columns = {row[1] for row in database.execute("PRAGMA table_info(scanned_jobs)")}
+        for name, definition in {
+            "status": "TEXT NOT NULL DEFAULT 'discovered'",
+            "status_reason": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if name not in columns:
+                database.execute(f"ALTER TABLE scanned_jobs ADD COLUMN {name} {definition}")
+        database.execute(
+            "UPDATE scanned_jobs SET updated_at = scanned_at WHERE updated_at = ''"
         )
         database.executemany(
             """INSERT INTO scanned_jobs (
@@ -508,6 +522,24 @@ def not_targeted_key(ctx):
     parts = [re.sub(r"\s+", " ", (ctx.get(key) or "").strip().lower())
              for key in ("title", "company", "location")]
     return "details:" + "|".join(parts)
+
+
+def update_job_status(ctx, status, reason="", path=SCANNED_JOBS_DB_PATH):
+    save_scanned_jobs([], path)
+    key = not_targeted_key(ctx)
+    with closing(sqlite3.connect(path)) as database, database:
+        exists = database.execute(
+            "SELECT 1 FROM scanned_jobs WHERE job_key = ?", (key,)
+        ).fetchone()
+    if not exists:
+        save_scanned_jobs([ctx], path)
+    with closing(sqlite3.connect(path)) as database, database:
+        database.execute(
+            """UPDATE scanned_jobs
+            SET status = ?, status_reason = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE job_key = ?""",
+            (status, reason, key),
+        )
 
 
 def load_not_targeted():
@@ -612,7 +644,9 @@ def _collect_current_search(page, role_profile, config):
             page.wait_for_timeout(1500)
             raw = job_context(page)
             raw["applicant_count"] = applicant_count(page)
-            jobs.append(normalize_job(raw, role_profile["name"]))
+            job = normalize_job(raw, role_profile["name"])
+            jobs.append(job)
+            save_scanned_jobs([job])
         except Exception as exc:
             print(f"[{index + 1}] could not collect card: {exc}")
     return jobs
@@ -710,18 +744,24 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         role_label = ", ".join(job.get("matched_roles") or ["unknown role"])
         identifier = job.get("job_id")
         if fit["tier"] not in ("A", "B"):
-            save_not_targeted(job, f"fit score {fit['score']} below threshold", role_label)
+            reason = f"fit score {fit['score']} below threshold"
+            save_not_targeted(job, reason, role_label)
+            update_job_status(job, "skipped", reason)
             skipped += 1
             continue
         if identifier and identifier in applied_ids:
+            update_job_status(job, "applied", "already recorded as applied")
             skipped += 1
             continue
         previous_skip = load_not_targeted().get(not_targeted_key(job))
         if previous_skip and "applicant cap" not in previous_skip.get("reason", ""):
+            update_job_status(job, "skipped", previous_skip.get("reason", "previously skipped"))
             skipped += 1
             continue
         if job.get("application_method") == "EXTERNAL":
-            save_not_targeted(job, "external application required", role_label)
+            reason = "external application required"
+            save_not_targeted(job, reason, role_label)
+            update_job_status(job, "skipped", reason)
             print(f"EXTERNAL APPLICATION REQUIRED: {job.get('url')}")
             skipped += 1
             continue
@@ -735,7 +775,9 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         live_count = applicant_count(page)
         live_id = job_id(live)
         if identifier and live_id and live_id != identifier:
-            save_not_targeted(job, "job identity changed after navigation", role_label)
+            reason = "job identity changed after navigation"
+            save_not_targeted(job, reason, role_label)
+            update_job_status(job, "error", reason)
             skipped += 1
             continue
         job = {
@@ -745,12 +787,16 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         if live_count is not None:
             job["applicant_count"] = live_count
         if already_applied(page):
+            update_job_status(job, "applied", "LinkedIn shows already applied")
             skipped += 1
             continue
         if not click_easy_apply(page, timeout=8000):
-            save_not_targeted(job, "no Easy Apply button", role_label)
+            reason = "no Easy Apply button"
+            save_not_targeted(job, reason, role_label)
+            update_job_status(job, "skipped", reason)
             skipped += 1
             continue
+        failure_reason = "application not submitted"
         try:
             sent = apply_to_current_job(
                 page,
@@ -760,19 +806,23 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
                 resume_path=item["selected_resume"],
                 store=store,
             )
-        except GeminiError:
+        except GeminiError as exc:
+            update_job_status(job, "error", str(exc))
             raise
         except Exception as exc:
             print(f"  [error] {exc}")
             page.screenshot(path=f"error_apply_{index + 1}.png")
+            failure_reason = str(exc)
             sent = False
         if sent:
             applied += 1
+            update_job_status(job, "applied")
             if identifier:
                 save_applied_id(identifier, job, role_label)
                 applied_ids.add(identifier)
         else:
-            save_not_targeted(job, "application not submitted", role_label)
+            save_not_targeted(job, failure_reason, role_label)
+            update_job_status(job, "error", failure_reason)
             skipped += 1
             dismiss_modal(page)
     return applied, skipped

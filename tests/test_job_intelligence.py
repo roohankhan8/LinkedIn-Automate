@@ -35,6 +35,7 @@ from linkedin_search import (
     save_applied_id,
     save_not_targeted,
     save_scanned_jobs,
+    update_job_status,
 )
 
 
@@ -353,9 +354,9 @@ class JobFitScoringTests(unittest.TestCase):
     def test_location_points_follow_requested_order(self):
         cases = [
             ({"location": "Karachi, Pakistan", "workplace_type": "On-site"}, 10),
-            ({"location": "Pakistan", "workplace_type": "Remote"}, 9),
+            ({"location": "Pakistan", "workplace_type": "Remote"}, 10),
             ({"location": "Islamabad, Pakistan", "workplace_type": "Hybrid"}, 7),
-            ({"location": "Dubai, UAE", "workplace_type": "Remote"}, 5),
+            ({"location": "Dubai, UAE", "workplace_type": "Remote"}, 10),
             ({"location": "Dubai, UAE", "workplace_type": "On-site"}, 0),
         ]
 
@@ -681,6 +682,7 @@ class SearchOrchestrationTests(unittest.TestCase):
             patch("linkedin_search.apply_to_current_job", return_value=False),
             patch("linkedin_search.save_applied_id") as save,
             patch("linkedin_search.save_not_targeted"),
+            patch("linkedin_search.update_job_status"),
         ):
             applied, skipped = apply_ranked_jobs(
                 page,
@@ -714,6 +716,7 @@ class SearchOrchestrationTests(unittest.TestCase):
             }),
             patch("linkedin_search.save_applied_id"),
             patch("linkedin_search.save_not_targeted") as save,
+            patch("linkedin_search.update_job_status"),
         ):
             applied, skipped = apply_ranked_jobs(
                 page, ranked,
@@ -734,15 +737,18 @@ class SearchOrchestrationTests(unittest.TestCase):
             )
             save_scanned_jobs([first], path)
             save_scanned_jobs([{**first, "applicant_count": 250}], path)
+            update_job_status(first, "skipped", "no Easy Apply button", path)
 
             with closing(sqlite3.connect(path)) as database:
                 rows = database.execute(
-                    "SELECT job_id, applicant_count, job_json FROM scanned_jobs"
+                    """SELECT job_id, applicant_count, job_json, status, status_reason
+                    FROM scanned_jobs"""
                 ).fetchall()
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][:2], ("123", 250))
         self.assertEqual(json.loads(rows[0][2])["matched_roles"], ["Backend Engineer"])
+        self.assertEqual(rows[0][3:], ("skipped", "no Easy Apply button"))
 
 
 if __name__ == "__main__":
