@@ -25,6 +25,7 @@ from job_intelligence import (
 )
 from linkedin_search import (
     _classic_search_url,
+    _collect_current_search,
     apply_ranked_jobs,
     discover_jobs,
     job_id,
@@ -600,7 +601,9 @@ class SearchOrchestrationTests(unittest.TestCase):
 
     def test_legacy_config_keeps_ten_search_page_default(self):
         config = normalize_config({"role": "Backend"})
-        observation = [normalize_job({"job_id": "123"}, "Backend")]
+        observation = [
+            normalize_job({"job_id": str(index)}, "Backend") for index in range(25)
+        ]
 
         with (
             patch("linkedin_search.load_links", return_value=[]),
@@ -609,6 +612,34 @@ class SearchOrchestrationTests(unittest.TestCase):
             discover_jobs(Mock(), config)
 
         self.assertEqual(collect.call_count, 10)
+
+    def test_discovery_stops_after_partial_page(self):
+        config = normalize_config({"role": "Backend", "max_search_pages": 10})
+        observation = [normalize_job({"job_id": "123"}, "Backend")]
+        with (
+            patch("linkedin_search.load_links", return_value=[]),
+            patch("linkedin_search._collect_current_search", return_value=observation) as collect,
+        ):
+            discover_jobs(Mock(), config)
+
+        self.assertEqual(collect.call_count, 1)
+
+    def test_transient_linkedin_results_error_reloads_once(self):
+        page = Mock()
+        page.locator.return_value.inner_text.return_value = (
+            "Unfortunately, things aren’t loading. We're having issues loading your results."
+        )
+        config = normalize_config({"role": "Backend", "page_load_wait_ms": 0})
+        profile = {"name": "Backend", "keywords": ["Backend"]}
+        with (
+            patch("linkedin_search.open_jobs_search"),
+            patch("linkedin_search.hydrate_cards", side_effect=[0, 0]) as hydrate,
+        ):
+            jobs = _collect_current_search(page, profile, config)
+
+        self.assertEqual(jobs, [])
+        self.assertEqual(hydrate.call_count, 2)
+        page.reload.assert_called_once()
 
     def test_ranked_pipeline_uses_selected_resume_profile(self):
         config = normalize_config({"role": "Backend Engineer"})
@@ -742,27 +773,37 @@ class SearchOrchestrationTests(unittest.TestCase):
                 "Backend Engineer",
             )
             save_scanned_jobs([first], path)
-            save_scanned_jobs([{**first, "applicant_count": 250}], path)
+            save_scanned_jobs(
+                [{**first, "applicant_count": 250, "fit_score": 72, "fit_tier": "B"}],
+                path,
+            )
             update_job_status(first, "skipped", "no Easy Apply button", path)
             retryable = normalize_job({"job_id": "456", "title": "API Engineer"}, "Backend Engineer")
             update_job_status(retryable, "skipped", "fit score 49 below threshold", path)
+            discovered = normalize_job({"job_id": "789", "title": "Python Engineer"}, "Backend Engineer")
+            save_scanned_jobs([discovered], path)
 
             with closing(sqlite3.connect(path)) as database:
                 rows = database.execute(
-                    """SELECT job_id, applicant_count, job_json, status, status_reason
+                    """SELECT job_id, applicant_count, job_json, status, status_reason,
+                    fit_score, fit_tier
                     FROM scanned_jobs"""
                 ).fetchall()
+                columns = {row[1] for row in database.execute("PRAGMA table_info(scanned_jobs)")}
             skipped_jobs = load_scanned_jobs("skipped", path)
             discovered_jobs = load_scanned_jobs("discovered", path)
             retryable_jobs = load_retryable_jobs(path)
 
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0][:2], ("123", 250))
         self.assertEqual(json.loads(rows[0][2])["matched_roles"], ["Backend Engineer"])
-        self.assertEqual(rows[0][3:], ("skipped", "no Easy Apply button"))
+        self.assertEqual(rows[0][3:5], ("skipped", "no Easy Apply button"))
+        self.assertEqual(rows[0][5:], (72, "B"))
         self.assertEqual(skipped_jobs[0]["job_id"], "123")
-        self.assertEqual(discovered_jobs, [])
-        self.assertEqual([job["job_id"] for job in retryable_jobs], ["456"])
+        self.assertEqual([job["job_id"] for job in discovered_jobs], ["789"])
+        self.assertEqual({job["job_id"] for job in retryable_jobs}, {"456", "789"})
+        self.assertIn("fit_score", columns)
+        self.assertEqual([job["job_id"] for job in retryable_jobs[:2]], ["789", "456"])
 
 
 if __name__ == "__main__":

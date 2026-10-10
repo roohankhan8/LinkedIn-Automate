@@ -11,9 +11,9 @@ from resume_profile import profile_for_prompt
 
 MODAL_SELECTORS = [
     "div.jobs-easy-apply-modal",
-    'div[role="dialog"]:has-text("Apply to")',
+    '[role="dialog"]:has-text("Apply to")',
     ".jobs-easy-apply-content",
-    "div[role='dialog']",
+    "[role='dialog']",
 ]
 
 SUCCESS_SELECTORS = [

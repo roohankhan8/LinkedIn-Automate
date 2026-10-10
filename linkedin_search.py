@@ -47,6 +47,7 @@ USER_AGENT = (
 LINKS_PATH = Path(__file__).resolve().parent / "links.txt"
 SCANNED_JOBS_DB_PATH = Path(__file__).resolve().parent / "scanned_jobs.db"
 RESUMES_DIR = Path(__file__).resolve().parent / "resumes"
+RESULTS_PAGE_SIZE = 25
 
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -268,6 +269,14 @@ def hydrate_cards(page, passes=4):
     return cards.count() if cards else 0
 
 
+def search_results_failed(page):
+    try:
+        text = (page.locator("body").inner_text() or "").lower()
+    except Exception:
+        return False
+    return "things aren" in text and "loading" in text or "issues loading your results" in text
+
+
 def job_cards(page):
     for sel in JOB_LIST_ITEM_SELECTORS:
         locs = page.locator(sel)
@@ -454,6 +463,8 @@ def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
                 scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 status TEXT NOT NULL DEFAULT 'discovered',
                 status_reason TEXT NOT NULL DEFAULT '',
+                fit_score REAL,
+                fit_tier TEXT,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )"""
         )
@@ -461,6 +472,8 @@ def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
         for name, definition in {
             "status": "TEXT NOT NULL DEFAULT 'discovered'",
             "status_reason": "TEXT NOT NULL DEFAULT ''",
+            "fit_score": "REAL",
+            "fit_tier": "TEXT",
             "updated_at": "TEXT NOT NULL DEFAULT ''",
         }.items():
             if name not in columns:
@@ -471,8 +484,8 @@ def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
         database.executemany(
             """INSERT INTO scanned_jobs (
                 job_key, job_id, title, company, location, url,
-                applicant_count, application_method, job_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                applicant_count, application_method, job_json, fit_score, fit_tier
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_key) DO UPDATE SET
                 job_id=excluded.job_id,
                 title=excluded.title,
@@ -482,6 +495,8 @@ def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
                 applicant_count=excluded.applicant_count,
                 application_method=excluded.application_method,
                 job_json=excluded.job_json,
+                fit_score=COALESCE(excluded.fit_score, scanned_jobs.fit_score),
+                fit_tier=COALESCE(excluded.fit_tier, scanned_jobs.fit_tier),
                 scanned_at=CURRENT_TIMESTAMP""",
             [
                 (
@@ -494,6 +509,8 @@ def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
                     job.get("applicant_count"),
                     job.get("application_method"),
                     json.dumps(job, ensure_ascii=False),
+                    job.get("fit_score"),
+                    job.get("fit_tier"),
                 )
                 for job in jobs
             ],
@@ -561,6 +578,7 @@ def load_retryable_jobs(path=SCANNED_JOBS_DB_PATH):
             """SELECT job_json FROM scanned_jobs
             WHERE status = 'discovered'
                OR (status = 'skipped' AND status_reason LIKE 'fit score %')"""
+            + " ORDER BY CASE status WHEN 'discovered' THEN 0 ELSE 1 END, updated_at"
         ).fetchall()
     jobs = []
     for (payload,) in rows:
@@ -638,6 +656,17 @@ def _collect_current_search(page, role_profile, config):
     keywords = " OR ".join(role_profile.get("keywords") or [role_profile["name"]])
     open_jobs_search(page, keywords, config, target_url=role_profile.get("target_url"))
     total = hydrate_cards(page)
+    if not total and search_results_failed(page):
+        print("LinkedIn failed to load this results page; retrying once.")
+        try:
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=int(config.get("navigation_timeout_ms", 60000)),
+            )
+        except PlaywrightTimeoutError:
+            pass
+        page.wait_for_timeout(config.get("page_load_wait_ms", 3000))
+        total = hydrate_cards(page)
     print(f"{total} job card(s) for {role_profile['name']}.")
     jobs = []
     for index in range(total):
@@ -665,7 +694,7 @@ def _page_url(url, page_number):
         return url
     parsed = urllib.parse.urlsplit(url)
     query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-    query["start"] = str(page_number * 25)
+    query["start"] = str(page_number * RESULTS_PAGE_SIZE)
     return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
 
 
@@ -699,7 +728,7 @@ def discover_jobs(page, config):
             page_profile = {**profile, "target_url": _page_url(base_url, page_number)}
             batch = _collect_current_search(page, page_profile, config)
             discovered.extend(batch)
-            if not batch:
+            if len(batch) < RESULTS_PAGE_SIZE:
                 break
     return deduplicate_jobs(discovered)
 
@@ -725,6 +754,8 @@ def prepare_ranked_jobs(jobs, resume_profiles, config, gemini=None):
             if name in profiles_by_name
         ] or list(profiles_by_name.values())
         fit = score_job(analyzed, resume_profiles[selected], matched_profiles, config)
+        analyzed["fit_score"] = fit["score"]
+        analyzed["fit_tier"] = fit["tier"]
         prepared.append(
             {
                 "job": analyzed,
@@ -889,6 +920,7 @@ def run(config):
             pending_ranked = prepare_ranked_jobs(
                 pending, resume_profiles, config, gemini
             )
+            save_scanned_jobs([item["job"] for item in pending_ranked])
             retried_applied, retried_skipped = apply_ranked_jobs(
                 page, pending_ranked, config, gemini, store, applied_ids
             )
@@ -896,6 +928,7 @@ def run(config):
         jobs = discover_jobs(page, config)
         save_scanned_jobs(jobs)
         ranked = prepare_ranked_jobs(jobs, resume_profiles, config, gemini)
+        save_scanned_jobs([item["job"] for item in ranked])
         print(f"\nRanked {len(ranked)} unique job(s) from {len(jobs)} discovery record(s).")
         for item in ranked:
             job, fit = item["job"], item["fit"]
