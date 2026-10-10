@@ -1,6 +1,8 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 from unittest.mock import Mock
@@ -32,6 +34,7 @@ from linkedin_search import (
     prepare_ranked_jobs,
     save_applied_id,
     save_not_targeted,
+    save_scanned_jobs,
 )
 
 
@@ -691,7 +694,7 @@ class SearchOrchestrationTests(unittest.TestCase):
         self.assertEqual((applied, skipped), (0, 1))
         save.assert_not_called()
 
-    def test_live_applicant_count_is_checked_before_applying(self):
+    def test_applicant_count_does_not_block_applying(self):
         page = Mock()
         ranked = [{
             "job": {"job_id": "123", "url": "https://www.linkedin.com/jobs/view/123",
@@ -704,8 +707,11 @@ class SearchOrchestrationTests(unittest.TestCase):
             patch("linkedin_search.job_context", return_value={"title": "Backend Engineer"}),
             patch("linkedin_search.applicant_count", return_value=101),
             patch("linkedin_search.already_applied", return_value=False),
-            patch("linkedin_search.click_easy_apply") as click,
+            patch("linkedin_search.click_easy_apply", return_value=True) as click,
             patch("linkedin_search.apply_to_current_job", return_value=True),
+            patch("linkedin_search.load_not_targeted", return_value={
+                "linkedin:123": {"reason": "over 100-applicant cap"}
+            }),
             patch("linkedin_search.save_applied_id"),
             patch("linkedin_search.save_not_targeted") as save,
         ):
@@ -715,9 +721,28 @@ class SearchOrchestrationTests(unittest.TestCase):
                 Mock(), Mock(), set(),
             )
 
-        self.assertEqual((applied, skipped), (0, 1))
-        click.assert_not_called()
-        self.assertIn("applicant cap", save.call_args.args[1])
+        self.assertEqual((applied, skipped), (1, 0))
+        click.assert_called_once()
+        save.assert_not_called()
+
+    def test_scanned_jobs_are_upserted_in_sqlite(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "jobs.db"
+            first = normalize_job(
+                {"job_id": "123", "title": "Backend Engineer", "company": "Example"},
+                "Backend Engineer",
+            )
+            save_scanned_jobs([first], path)
+            save_scanned_jobs([{**first, "applicant_count": 250}], path)
+
+            with closing(sqlite3.connect(path)) as database:
+                rows = database.execute(
+                    "SELECT job_id, applicant_count, job_json FROM scanned_jobs"
+                ).fetchall()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][:2], ("123", 250))
+        self.assertEqual(json.loads(rows[0][2])["matched_roles"], ["Backend Engineer"])
 
 
 if __name__ == "__main__":

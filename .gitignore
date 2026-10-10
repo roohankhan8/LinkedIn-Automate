@@ -4,3 +4,8 @@ venv
 browser_data
 .env
 *.log
+scanned_jobs.db
+debug_page.html
+error_apply_*.png
+easy_apply_*.png
+resumes

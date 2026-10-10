@@ -4,9 +4,11 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import urllib.parse
+from contextlib import closing
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -45,6 +47,7 @@ LINKS_PATH = Path(__file__).resolve().parent / "links.txt"
 NOT_TARGETED_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.txt"
 NOT_TARGETED_JSON_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.json"
 APPLIED_JOBS_PATH = Path(__file__).resolve().parent / "applied_jobs.json"
+SCANNED_JOBS_DB_PATH = Path(__file__).resolve().parent / "scanned_jobs.db"
 RESUMES_DIR = Path(__file__).resolve().parent / "resumes"
 
 STEALTH_SCRIPT = """
@@ -447,6 +450,54 @@ def save_applied_id(identifier, ctx=None, role=None):
     )
 
 
+def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
+    with closing(sqlite3.connect(path)) as database, database:
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS scanned_jobs (
+                job_key TEXT PRIMARY KEY,
+                job_id TEXT,
+                title TEXT,
+                company TEXT,
+                location TEXT,
+                url TEXT,
+                applicant_count INTEGER,
+                application_method TEXT,
+                job_json TEXT NOT NULL,
+                scanned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        database.executemany(
+            """INSERT INTO scanned_jobs (
+                job_key, job_id, title, company, location, url,
+                applicant_count, application_method, job_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_key) DO UPDATE SET
+                job_id=excluded.job_id,
+                title=excluded.title,
+                company=excluded.company,
+                location=excluded.location,
+                url=excluded.url,
+                applicant_count=excluded.applicant_count,
+                application_method=excluded.application_method,
+                job_json=excluded.job_json,
+                scanned_at=CURRENT_TIMESTAMP""",
+            [
+                (
+                    not_targeted_key(job),
+                    job_id(job),
+                    job.get("title") or "",
+                    job.get("company") or "",
+                    job.get("location") or "",
+                    job.get("url") or "",
+                    job.get("applicant_count"),
+                    job.get("application_method"),
+                    json.dumps(job, ensure_ascii=False),
+                )
+                for job in jobs
+            ],
+        )
+
+
 def not_targeted_key(ctx):
     identifier = job_id(ctx)
     if identifier:
@@ -649,7 +700,6 @@ def prepare_ranked_jobs(jobs, resume_profiles, config, gemini=None):
 
 
 def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
-    max_applicants = int(config.get("applicants") or 0) or None
     max_applications = int(config.get("max_applications", 5))
     applied = skipped = 0
     for index, item in enumerate(ranked_jobs):
@@ -666,12 +716,8 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         if identifier and identifier in applied_ids:
             skipped += 1
             continue
-        if load_not_targeted().get(not_targeted_key(job)):
-            skipped += 1
-            continue
-        count = job.get("applicant_count")
-        if max_applicants and count is not None and count > max_applicants:
-            save_not_targeted(job, f"over {max_applicants}-applicant cap", role_label)
+        previous_skip = load_not_targeted().get(not_targeted_key(job))
+        if previous_skip and "applicant cap" not in previous_skip.get("reason", ""):
             skipped += 1
             continue
         if job.get("application_method") == "EXTERNAL":
@@ -698,11 +744,6 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         }
         if live_count is not None:
             job["applicant_count"] = live_count
-        count = job.get("applicant_count")
-        if max_applicants and count is not None and count > max_applicants:
-            save_not_targeted(job, f"over {max_applicants}-applicant cap", role_label)
-            skipped += 1
-            continue
         if already_applied(page):
             skipped += 1
             continue
@@ -774,6 +815,7 @@ def run(config):
             raise RuntimeError("No resume profile could be loaded or built")
 
         jobs = discover_jobs(page, config)
+        save_scanned_jobs(jobs)
         ranked = prepare_ranked_jobs(jobs, resume_profiles, config, gemini)
         print(f"\nRanked {len(ranked)} unique job(s) from {len(jobs)} discovery record(s).")
         for item in ranked:
