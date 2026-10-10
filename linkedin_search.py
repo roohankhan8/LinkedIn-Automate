@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.parse
 from contextlib import closing
+from datetime import date
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -44,9 +45,6 @@ USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 LINKS_PATH = Path(__file__).resolve().parent / "links.txt"
-NOT_TARGETED_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.txt"
-NOT_TARGETED_JSON_PATH = Path(__file__).resolve().parent / "not_targeted_jobs.json"
-APPLIED_JOBS_PATH = Path(__file__).resolve().parent / "applied_jobs.json"
 SCANNED_JOBS_DB_PATH = Path(__file__).resolve().parent / "scanned_jobs.db"
 RESUMES_DIR = Path(__file__).resolve().parent / "resumes"
 
@@ -296,6 +294,26 @@ def applicant_count(page):
     return None
 
 
+def posting_age_days(value, today=None):
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    today = today or date.today()
+    try:
+        return max(0, (today - date.fromisoformat(text)).days)
+    except ValueError:
+        pass
+    if re.search(r"\b(today|hours?|minutes?|just now)\b", text):
+        return 0
+    match = re.search(r"(\d+)\+?\s+(day|week|month|year)s?\s+ago", text)
+    if match:
+        multiplier = {"day": 1, "week": 7, "month": 30, "year": 365}[match.group(2)]
+        return int(match.group(1)) * multiplier
+    if "over a month ago" in text:
+        return 31
+    return None
+
+
 def job_context(page):
     location_text = text_of(page, JOB_LOCATION_SELECTORS)
     parts = [part.strip() for part in location_text.split("·") if part.strip()]
@@ -403,51 +421,21 @@ def job_id(ctx):
     return match.group(1) if match else None
 
 
-def load_applied_ids():
-    if not APPLIED_JOBS_PATH.exists():
-        return set()
-    try:
-        data = json.loads(APPLIED_JOBS_PATH.read_text(encoding="utf-8"))
+def load_applied_ids(path=SCANNED_JOBS_DB_PATH):
+    path = Path(path)
+    save_scanned_jobs([], path)
+    with closing(sqlite3.connect(path)) as database:
         return {
-            str(value.get("job_id")) if isinstance(value, dict) else str(value)
-            for value in data
-            if (value.get("job_id") if isinstance(value, dict) else value)
+            str(row[0])
+            for row in database.execute(
+                "SELECT job_id FROM scanned_jobs WHERE status = 'applied' AND job_id IS NOT NULL"
+            )
         }
-    except (OSError, json.JSONDecodeError):
-        return set()
 
 
-def save_applied_id(identifier, ctx=None, role=None):
-    records = {}
-    if APPLIED_JOBS_PATH.exists():
-        try:
-            data = json.loads(APPLIED_JOBS_PATH.read_text(encoding="utf-8"))
-            for value in data if isinstance(data, list) else []:
-                item_id = value.get("job_id") if isinstance(value, dict) else value
-                if item_id:
-                    records[str(item_id)] = (
-                        {**value, "job_id": str(item_id), "status": "applied"}
-                        if isinstance(value, dict)
-                        else {"job_id": str(item_id), "status": "applied"}
-                    )
-        except (OSError, json.JSONDecodeError):
-            pass
-    record = {"job_id": str(identifier), "status": "applied"}
-    if ctx:
-        record.update(
-            {
-                "title": (ctx.get("title") or "").strip(),
-                "company": (ctx.get("company") or "").strip(),
-                "location": (ctx.get("location") or "").strip(),
-                "url": ctx.get("url") or "",
-                "target_role": role or "",
-            }
-        )
-    records[str(identifier)] = record
-    APPLIED_JOBS_PATH.write_text(
-        json.dumps(sorted(records.values(), key=lambda item: item["job_id"]), indent=2),
-        encoding="utf-8",
-    )
+def save_applied_id(identifier, ctx=None, role=None, path=SCANNED_JOBS_DB_PATH):
+    job = {**(ctx or {}), "job_id": str(identifier)}
+    update_job_status(job, "applied", path=path)
 
 
 def save_scanned_jobs(jobs, path=SCANNED_JOBS_DB_PATH):
@@ -542,49 +530,69 @@ def update_job_status(ctx, status, reason="", path=SCANNED_JOBS_DB_PATH):
         )
 
 
-def load_not_targeted():
-    if not NOT_TARGETED_JSON_PATH.exists():
-        return {}
-    try:
-        data = json.loads(NOT_TARGETED_JSON_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(data, list):
-        return {}
-    return {
-        item.get("key"): item
-        for item in data
-        if isinstance(item, dict) and item.get("key")
-    }
+def load_scanned_jobs(status=None, path=SCANNED_JOBS_DB_PATH):
+    path = Path(path)
+    if not path.exists():
+        return []
+    with closing(sqlite3.connect(path)) as database:
+        query = "SELECT job_json FROM scanned_jobs"
+        params = ()
+        if status:
+            query += " WHERE status = ?"
+            params = (status,)
+        rows = database.execute(query, params).fetchall()
+    jobs = []
+    for (payload,) in rows:
+        try:
+            job = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(job, dict):
+            jobs.append(job)
+    return jobs
 
 
-def save_not_targeted(ctx, reason, role):
-    title = (ctx.get("title") or "Untitled job").replace("\n", " ").strip()
-    company = (ctx.get("company") or "Unknown company").replace("\n", " ").strip()
-    location = (ctx.get("location") or "Unknown location").replace("\n", " ").strip()
-    key = not_targeted_key(ctx)
-    records = load_not_targeted()
-    records[key] = {
-        "key": key,
-        "status": "not_targeted",
-        "job_id": job_id(ctx),
-        "title": title,
-        "company": company,
-        "location": location,
-        "url": ctx.get("url") or "",
-        "reason": reason,
-        "target_role": role,
-    }
-    NOT_TARGETED_JSON_PATH.write_text(
-        json.dumps(sorted(records.values(), key=lambda item: item["key"]), indent=2),
-        encoding="utf-8",
-    )
-    
-    line = f"{title} | {company} | {location} | {reason} | target: {role}"
-    existing = (NOT_TARGETED_PATH.read_text(encoding="utf-8").splitlines()
-                if NOT_TARGETED_PATH.exists() else [])
-    lines = list(dict.fromkeys(existing + [line]))
-    NOT_TARGETED_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def load_retryable_jobs(path=SCANNED_JOBS_DB_PATH):
+    path = Path(path)
+    if not path.exists():
+        return []
+    with closing(sqlite3.connect(path)) as database:
+        rows = database.execute(
+            """SELECT job_json FROM scanned_jobs
+            WHERE status = 'discovered'
+               OR (status = 'skipped' AND status_reason LIKE 'fit score %')"""
+        ).fetchall()
+    jobs = []
+    for (payload,) in rows:
+        try:
+            job = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(job, dict):
+            jobs.append(job)
+    return jobs
+
+
+def load_not_targeted(path=SCANNED_JOBS_DB_PATH):
+    path = Path(path)
+    save_scanned_jobs([], path)
+    with closing(sqlite3.connect(path)) as database:
+        rows = database.execute(
+            """SELECT job_key, job_json, status_reason FROM scanned_jobs
+            WHERE status IN ('skipped', 'error')"""
+        ).fetchall()
+    records = {}
+    for key, payload, reason in rows:
+        try:
+            job = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            job = {}
+        records[key] = {**job, "key": key, "reason": reason}
+    return records
+
+
+def save_not_targeted(ctx, reason, role, path=SCANNED_JOBS_DB_PATH):
+    update_job_status(ctx, "skipped", reason, path)
 
 
 def allowed_location(ctx):
@@ -754,8 +762,10 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
             skipped += 1
             continue
         previous_skip = load_not_targeted().get(not_targeted_key(job))
-        if previous_skip and "applicant cap" not in previous_skip.get("reason", ""):
-            update_job_status(job, "skipped", previous_skip.get("reason", "previously skipped"))
+        previous_reason = previous_skip.get("reason", "") if previous_skip else ""
+        retryable_skip = "applicant cap" in previous_reason or previous_reason.startswith("fit score ")
+        if previous_skip and not retryable_skip:
+            update_job_status(job, "skipped", previous_reason or "previously skipped")
             skipped += 1
             continue
         if job.get("application_method") == "EXTERNAL":
@@ -786,6 +796,13 @@ def apply_ranked_jobs(page, ranked_jobs, config, gemini, store, applied_ids):
         }
         if live_count is not None:
             job["applicant_count"] = live_count
+        age = posting_age_days(job.get("posting_date"))
+        if age is not None and age > 30:
+            reason = f"posted {age} days ago"
+            save_not_targeted(job, reason, role_label)
+            update_job_status(job, "skipped", reason)
+            skipped += 1
+            continue
         if already_applied(page):
             update_job_status(job, "applied", "LinkedIn shows already applied")
             skipped += 1
@@ -864,6 +881,18 @@ def run(config):
             browser.close()
             raise RuntimeError("No resume profile could be loaded or built")
 
+        applied_ids = load_applied_ids()
+        pending = load_retryable_jobs()
+        retried_applied = retried_skipped = 0
+        if pending:
+            print(f"\nRetrying {len(pending)} previously discovered job(s) before searching.")
+            pending_ranked = prepare_ranked_jobs(
+                pending, resume_profiles, config, gemini
+            )
+            retried_applied, retried_skipped = apply_ranked_jobs(
+                page, pending_ranked, config, gemini, store, applied_ids
+            )
+
         jobs = discover_jobs(page, config)
         save_scanned_jobs(jobs)
         ranked = prepare_ranked_jobs(jobs, resume_profiles, config, gemini)
@@ -872,9 +901,17 @@ def run(config):
             job, fit = item["job"], item["fit"]
             print(f"  [{fit['tier']}] {fit['score']}/100 {job['title']} @ {job['company']} -> {Path(item['selected_resume']).name}")
 
+        remaining_config = {
+            **config,
+            "max_applications": max(
+                0, int(config.get("max_applications", 5)) - retried_applied
+            ),
+        }
         applied, skipped = apply_ranked_jobs(
-            page, ranked, config, gemini, store, load_applied_ids()
+            page, ranked, remaining_config, gemini, store, applied_ids
         )
+        applied += retried_applied
+        skipped += retried_skipped
         print(f"\nDone. Applied to {applied} job(s), skipped {skipped}.")
         context.close()
         browser.close()

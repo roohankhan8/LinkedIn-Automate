@@ -24,14 +24,17 @@ from job_intelligence import (
     score_job,
 )
 from linkedin_search import (
-    APPLIED_JOBS_PATH,
-    NOT_TARGETED_JSON_PATH,
     _classic_search_url,
     apply_ranked_jobs,
     discover_jobs,
     job_id,
+    load_applied_ids,
+    load_not_targeted,
+    load_scanned_jobs,
+    load_retryable_jobs,
     load_resume_profiles,
     prepare_ranked_jobs,
+    posting_age_days,
     save_applied_id,
     save_not_targeted,
     save_scanned_jobs,
@@ -485,36 +488,37 @@ class JobFitScoringTests(unittest.TestCase):
 
 
 class SearchOrchestrationTests(unittest.TestCase):
+    def test_posting_age_parses_known_dates_and_preserves_unknown(self):
+        today = date(2026, 10, 10)
+
+        self.assertEqual(posting_age_days("2026-09-10", today), 30)
+        self.assertEqual(posting_age_days("5 weeks ago", today), 35)
+        self.assertEqual(posting_age_days("23 hours ago", today), 0)
+        self.assertIsNone(posting_age_days(None, today))
+
     def test_applied_job_is_saved_as_a_structured_record(self):
         job = {
             "job_id": "123", "title": "Backend Engineer", "company": "Example",
             "location": "Karachi", "url": "https://www.linkedin.com/jobs/view/123",
         }
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "applied_jobs.json"
-            path.write_text(json.dumps(["old-id"]), encoding="utf-8")
-            with patch("linkedin_search.APPLIED_JOBS_PATH", path):
-                save_applied_id("123", job, "Backend Engineer")
-            records = json.loads(path.read_text(encoding="utf-8"))
+            path = Path(root) / "jobs.db"
+            save_applied_id("123", job, "Backend Engineer", path)
+            records = load_scanned_jobs("applied", path)
+            applied_ids = load_applied_ids(path)
 
         by_id = {record["job_id"]: record for record in records}
-        self.assertEqual(by_id["old-id"], {"job_id": "old-id", "status": "applied"})
+        self.assertEqual(applied_ids, {"123"})
         self.assertEqual(by_id["123"]["title"], "Backend Engineer")
-        self.assertEqual(by_id["123"]["target_role"], "Backend Engineer")
 
     def test_not_targeted_record_has_explicit_status(self):
         job = {"job_id": "123", "title": "Backend Engineer", "company": "Example", "location": "Karachi"}
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "not_targeted_jobs.json"
-            text_path = Path(root) / "not_targeted_jobs.txt"
-            with (
-                patch("linkedin_search.NOT_TARGETED_JSON_PATH", path),
-                patch("linkedin_search.NOT_TARGETED_PATH", text_path),
-            ):
-                save_not_targeted(job, "no Easy Apply button", "Backend Engineer")
-            records = json.loads(path.read_text(encoding="utf-8"))
+            path = Path(root) / "jobs.db"
+            save_not_targeted(job, "no Easy Apply button", "Backend Engineer", path)
+            records = load_not_targeted(path)
 
-        self.assertEqual(records[0]["status"], "not_targeted")
+        self.assertEqual(records["linkedin:123"]["reason"], "no Easy Apply button")
 
     def test_saved_sdui_link_becomes_unpinned_classic_search(self):
         url = _classic_search_url(
@@ -680,6 +684,7 @@ class SearchOrchestrationTests(unittest.TestCase):
             patch("linkedin_search.already_applied", return_value=False),
             patch("linkedin_search.click_easy_apply", return_value=True),
             patch("linkedin_search.apply_to_current_job", return_value=False),
+            patch("linkedin_search.posting_age_days", return_value=0),
             patch("linkedin_search.save_applied_id") as save,
             patch("linkedin_search.save_not_targeted"),
             patch("linkedin_search.update_job_status"),
@@ -711,6 +716,7 @@ class SearchOrchestrationTests(unittest.TestCase):
             patch("linkedin_search.already_applied", return_value=False),
             patch("linkedin_search.click_easy_apply", return_value=True) as click,
             patch("linkedin_search.apply_to_current_job", return_value=True),
+            patch("linkedin_search.posting_age_days", return_value=0),
             patch("linkedin_search.load_not_targeted", return_value={
                 "linkedin:123": {"reason": "over 100-applicant cap"}
             }),
@@ -738,17 +744,25 @@ class SearchOrchestrationTests(unittest.TestCase):
             save_scanned_jobs([first], path)
             save_scanned_jobs([{**first, "applicant_count": 250}], path)
             update_job_status(first, "skipped", "no Easy Apply button", path)
+            retryable = normalize_job({"job_id": "456", "title": "API Engineer"}, "Backend Engineer")
+            update_job_status(retryable, "skipped", "fit score 49 below threshold", path)
 
             with closing(sqlite3.connect(path)) as database:
                 rows = database.execute(
                     """SELECT job_id, applicant_count, job_json, status, status_reason
                     FROM scanned_jobs"""
                 ).fetchall()
+            skipped_jobs = load_scanned_jobs("skipped", path)
+            discovered_jobs = load_scanned_jobs("discovered", path)
+            retryable_jobs = load_retryable_jobs(path)
 
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0][:2], ("123", 250))
         self.assertEqual(json.loads(rows[0][2])["matched_roles"], ["Backend Engineer"])
         self.assertEqual(rows[0][3:], ("skipped", "no Easy Apply button"))
+        self.assertEqual(skipped_jobs[0]["job_id"], "123")
+        self.assertEqual(discovered_jobs, [])
+        self.assertEqual([job["job_id"] for job in retryable_jobs], ["456"])
 
 
 if __name__ == "__main__":

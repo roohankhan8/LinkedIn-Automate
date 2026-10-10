@@ -1,37 +1,57 @@
-"""Persistent cache of application questions and the answers we gave them.
-
-Keyed by a normalised form of the question so trivial wording differences
-(punctuation, casing, whitespace) still hit the cache instead of Gemini.
-"""
+"""SQLite-backed cache of application questions and answers."""
 
 import json
-import os
 import re
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 
-QA_PATH = "qa_cache.json"
+DB_PATH = Path(__file__).resolve().parent / "scanned_jobs.db"
 MAX_STORED_OPTIONS = 25
 
 
 def normalise(question):
     q = question.strip().lower()
     q = re.sub(r"\s+", " ", q)
-    q = re.sub(r"[^\w\s]", "", q)
-    return q
+    return re.sub(r"[^\w\s]", "", q)
 
 
 class QAStore:
-    def __init__(self, path=QA_PATH):
-        self.path = path
-        self.data = {}
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
+    def __init__(self, path=DB_PATH):
+        self.path = Path(path)
+        with closing(sqlite3.connect(self.path)) as database, database:
+            database.execute(
+                """CREATE TABLE IF NOT EXISTS qa_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    entry_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+
+    def as_dict(self):
+        with closing(sqlite3.connect(self.path)) as database:
+            rows = database.execute("SELECT cache_key, entry_json FROM qa_cache").fetchall()
+        return {key: json.loads(payload) for key, payload in rows}
+
+    def replace(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("QA cache must be a JSON object")
+        with closing(sqlite3.connect(self.path)) as database, database:
+            database.execute("DELETE FROM qa_cache")
+            database.executemany(
+                "INSERT INTO qa_cache (cache_key, entry_json) VALUES (?, ?)",
+                [(key, json.dumps(value, ensure_ascii=False)) for key, value in data.items()],
+            )
 
     def get(self, question, field_type=None, options=None):
-        entry = self.data.get(normalise(question))
-        if not entry:
+        with closing(sqlite3.connect(self.path)) as database:
+            row = database.execute(
+                "SELECT entry_json FROM qa_cache WHERE cache_key = ?",
+                (normalise(question),),
+            ).fetchone()
+        if not row:
             return None
-        # A cached answer is only reusable if it is still one of the offered options.
+        entry = json.loads(row[0])
         if options and entry.get("answer") not in options:
             return None
         if field_type and entry.get("field_type") and entry["field_type"] != field_type:
@@ -39,23 +59,24 @@ class QAStore:
         return entry.get("answer")
 
     def put(self, question, answer, field_type=None, options=None):
-        # Stored options are informational only (get() validates against the live
-        # options), so long lists like the 240-entry country-code dropdown are
-        # truncated to keep the cache file readable.
         stored = options or None
         if stored and len(stored) > MAX_STORED_OPTIONS:
             stored = stored[:MAX_STORED_OPTIONS] + [f"... +{len(options) - MAX_STORED_OPTIONS} more"]
-        self.data[normalise(question)] = {
+        entry = {
             "question": question.strip(),
             "answer": answer,
             "field_type": field_type,
             "options": stored,
         }
-        self.save()
-
-    def save(self):
-        with open(self.path, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        with closing(sqlite3.connect(self.path)) as database, database:
+            database.execute(
+                """INSERT INTO qa_cache (cache_key, entry_json) VALUES (?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    entry_json = excluded.entry_json,
+                    updated_at = CURRENT_TIMESTAMP""",
+                (normalise(question), json.dumps(entry, ensure_ascii=False)),
+            )
 
     def __len__(self):
-        return len(self.data)
+        with closing(sqlite3.connect(self.path)) as database:
+            return database.execute("SELECT COUNT(*) FROM qa_cache").fetchone()[0]

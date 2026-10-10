@@ -12,7 +12,6 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 ENV_PATH = BASE_DIR / ".env"
 RESUME_PROFILE_PATH = BASE_DIR / "resume_profile.json"
-QA_CACHE_PATH = BASE_DIR / "qa_cache.json"
 STATE_PATH = BASE_DIR / "linkedin_state.json"
 LOGIN_DONE_FLAG = BASE_DIR / "login_done.flag"
 ERROR_LOG_PATH = BASE_DIR / "error.log"
@@ -158,11 +157,13 @@ def resume_profile_route():
 
 @app.route("/api/qa_cache", methods=["GET", "POST"])
 def qa_cache_route():
+    from qa_store import QAStore
+
+    store = QAStore()
     if request.method == "POST":
-        data = request.get_json()
-        _write_json(QA_CACHE_PATH, data)
+        store.replace(request.get_json())
         return jsonify({"ok": True})
-    return jsonify(_read_json(QA_CACHE_PATH))
+    return jsonify(store.as_dict())
 
 
 @app.route("/api/status")

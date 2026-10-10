@@ -38,7 +38,7 @@ Step 2 runs automatically as part of step 3 if `resume_profile.json` is missing.
 | `config.json` | Role, applicant cap, resume path, max applications, model |
 | `linkedin_login.py` | Headed login, saves `linkedin_state.json` |
 | `resume_profile.py` | Resume -> `resume_profile.json` via Gemini (cached) |
-| `qa_store.py` | Question/answer cache in `qa_cache.json` |
+| `qa_store.py` | Question/answer cache in `scanned_jobs.db` |
 | `easy_apply.py` | Reads modal fields, answers via Gemini, submits |
 | `linkedin_search.py` | Orchestrator: search -> iterate cards -> apply |
 | `gemini_client.py` | Gemini API wrapper |
@@ -74,7 +74,7 @@ counts for every candidate selector plus the repeated list shapes on the page.
   Easy Apply are enforced by the `f_TPR=r86400` / `f_AL=true` URL filters, and the
   applicant cap is enforced by reading the count off the details panel and
   skipping jobs above `applicants`. Set to `"template"` to send the full string.
-- Answers are cached in `qa_cache.json` by normalised question text, so repeat
+- Answers are cached in SQLite by normalised question text, so repeat
   questions never hit the API twice. A cached answer is discarded if it is no
   longer one of the offered options.
 - LinkedIn's job detail panel uses hashed class names. The Easy Apply button is

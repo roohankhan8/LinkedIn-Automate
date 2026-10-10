@@ -4,9 +4,11 @@ A desktop Windows application that automates LinkedIn job searches and Easy Appl
 
 ## What it does
 
-- Searches LinkedIn jobs by role, location, and Easy Apply filter.
-- Auto-fills LinkedIn Easy Apply forms based on your resume and a question/answer cache.
+- Searches multiple configured roles through LinkedIn's classic jobs results page.
+- Normalizes, deduplicates, scores, and stores every discovered job in SQLite.
+- Selects the best available resume and auto-fills LinkedIn Easy Apply forms.
 - Uses Gemini or a local Ollama model to answer free-text and numeric form questions.
+- Retries discovered jobs and fit-score skips on later runs.
 - Runs in a desktop window (Flask + pywebview).
 
 ## Requirements
@@ -33,7 +35,6 @@ This will:
 - Copy the example files to real config files:
   - `.env.example` → `.env`
   - `config.example.json` → `config.json`
-  - `resume_profile.example.json` → `resume_profile.json`
 - Add a **LinkedIn Apply** shortcut to your desktop.
 
 3. Run the app:
@@ -52,9 +53,10 @@ Or double-click the **LinkedIn Apply** shortcut on your desktop.
    If you use a local LLM, skip this and set `llm_provider` to `local` in the next step.
 
 2. **Config tab**  
-   - `role` – job title to search (e.g. `Django Backend Developer`).
-   - `location` – job location (e.g. `India`).
-   - `applicants` – maximum number of applicants for a job posting.
+   - `target_roles` – enabled job titles, priorities, keywords, and fit thresholds.
+   - `locations` / `remote` – preferred locations; remote jobs are accepted globally.
+   - `posted_within_days` – search window: 1, 3, or 7 days.
+   - `minimum_fit_score` – minimum score to apply; currently 50.
    - `max_applications` – how many applications to submit in one run.
    - `resume_path` – full path to your PDF resume.
    - `llm_provider` – `gemini` or `local`.
@@ -62,7 +64,7 @@ Or double-click the **LinkedIn Apply** shortcut on your desktop.
    - `local_model` – Ollama model name (e.g. `llama3.2:1b`).
 
 3. **Resume Profile tab**  
-   Paste a JSON profile built from your resume, or let the app build it from your PDF.  
+   Put resumes in `resumes/`. The bot builds and caches a factual profile for each file, then ranks them per job.
    To build it manually with Gemini, ask:
 
    > Extract a JSON profile with these fields: full_name, first_name, last_name, email, phone, phone_country_code, city, state, country, linkedin_url, github_url, portfolio_url, headline, summary, total_years_experience, current_title, current_company, highest_degree, field_of_study, university, graduation_year, skills, skill_years, certifications, languages, work_authorization, requires_visa_sponsorship, willing_to_relocate, notice_period_days, current_ctc, expected_ctc.
@@ -117,13 +119,22 @@ Or double-click the **LinkedIn Apply** shortcut on your desktop.
 - **"Local model is not available"**: pull it first with `docker exec ollama ollama pull <model>`.
 - **Playwright browser not found**: run `.\venv\Scripts\python.exe -m playwright install chromium`.
 
+## Application rules and storage
+
+- Jobs scoring 50 or higher are eligible for application.
+- Jobs confirmed to be over 30 days old are skipped; unknown posting dates are allowed.
+- Applicant count does not block an application.
+- Previously discovered jobs and fit-score skips are retried before a new search.
+- `scanned_jobs.db` stores job details, applied/skipped/error status, reasons, timestamps, and cached application answers.
+- Applied jobs and other terminal statuses are not reset by later scans.
+
 ## For developers
 
-- Real user data files are ignored by `.gitignore`. Only `*.example.json`, `.env.example`, templates, and source code are committed.
-- If these files were already tracked by git, remove them before pushing:
+- Runtime state and personal files are ignored by Git: `.env`, `config.json`, `linkedin_state.json`, `resume_profile.json`, `resume_profiles/`, `resumes/`, and `scanned_jobs.db`.
+- If private files were previously tracked, remove them from the index without deleting local copies:
 
   ```powershell
-  git rm --cached config.json resume_profile.json .env linkedin_state.json qa_cache.json
+  git rm --cached config.json resume_profile.json linkedin_state.json
   ```
 
 ## Manual install (without the installer)
@@ -134,6 +145,5 @@ python -m venv venv
 .\venv\Scripts\python.exe -m playwright install chromium
 copy .env.example .env
 copy config.example.json config.json
-copy resume_profile.example.json resume_profile.json
 python main.py
 ```
